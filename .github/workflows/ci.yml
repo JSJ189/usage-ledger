@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22.x", "24.x"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # 只有 devDependencies（vitest + jsdom）；用 ci 保证锁文件一致
+      - run: npm ci
+
+      # manifest / 权限白名单 / 版本一致 / 价目原文体积
+      - run: node scripts/check-manifest.mjs
+
+      # 单测：纯函数 + 一个 jsdom 客户端测试，离线、无需数据库
+      - run: npm test

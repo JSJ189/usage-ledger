@@ -1,0 +1,18 @@
+{
+	"id": "usage-ledger",
+	"name": "用量账本",
+	"source": "JSJ189/usage-ledger",
+	"author": "JSJ189",
+	"description": "只读聚合本机代理的 SQLite 用量账本：请求数、成功率、TTFT 分布、时延、输出速率、token 用量与路由分布，并给出带来源与快照时间的估算成本；底栏显示今日请求数，点击打开看板。支持 EasyCLIProxyAPI 与任意兼容 usage_events schema 的账本。",
+	"descriptionEn": "Read-only aggregation of the local SQLite usage ledger: requests, success rate, TTFT, latency, throughput, tokens and per-route cost, with estimated cost labelled by source and snapshot time. Works with EasyCLIProxyAPI and any ledger with a compatible usage_events schema.",
+	"homepage": "https://github.com/JSJ189/usage-ledger",
+	"icon": "📊",
+	"tags": [
+		"统计",
+		"代理",
+		"用量",
+		"成本",
+		"sqlite",
+		"observability"
+	]
+}

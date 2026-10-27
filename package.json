@@ -1,0 +1,41 @@
+{
+  "name": "pi-web-ui-plugin-usage-ledger",
+  "version": "1.0.0",
+  "private": false,
+  "description": "pi-web-ui 界面插件：只读聚合本机代理的 SQLite 用量账本（请求 / TTFT / token / 估算成本）",
+  "license": "MIT",
+  "author": "JSJ189",
+  "homepage": "https://github.com/JSJ189/usage-ledger",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JSJ189/usage-ledger.git"
+  },
+  "type": "module",
+  "keywords": [
+    "pi-web-ui",
+    "pi-web-ui-plugin",
+    "sqlite",
+    "usage",
+    "observability"
+  ],
+  "files": [
+    "index.mjs",
+    "lib/",
+    "client/",
+    "manifest.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "check": "node scripts/check-manifest.mjs",
+    "verify:db": "node scripts/verify-real-db.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^30.1.0",
+    "vitest": "^5.0.1"
+  }
+}

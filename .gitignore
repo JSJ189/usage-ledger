@@ -1,0 +1,5 @@
+node_modules/
+.cps-tmp/
+*.log
+coverage/
+.DS_Store
