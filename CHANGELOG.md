@@ -1,5 +1,25 @@
 # CHANGELOG
 
+## 2.0.1 — 修复回填去重把几万次真实调用合并掉（P0）
+
+### 修复
+
+- **P0｜回填去重键改成唯一身份 `sessionFile + entry.id`**。2.0.0 用 `ts + model + provider` 给回填记录去重，同一毫秒内的多次调用（并行 / 子代理）被折叠成一条：实测 7 天窗口里 43,470 次真实调用（48,867 行 assistant，entry id 全唯一）被合并成 10,607 条，最严重的一毫秒有 16 次调用共用同一个键，token 与成本只有真值的 1/3——调用数 10,633 vs 43,470，金额 $187.81 vs $349.78。现在回填记录只认 `sessionFile + entry.id`；没有 `id` 的老行按出现顺序合成稳定序号，**绝不**退化成内容键。
+- **P0｜live ↔ 回填改成严格 1:1 贪心配对**。候选条件：同 `model` + 同 `provider` + `|Δts| ≤ 3000ms`，取 ts 最接近的一条；每条 live 最多认领一条回填，每条回填也最多被认领一次（`paired` 标记），**严禁 1→N 合并**。配不上就各自保留（live 标只算实时、回填 TTFT 为 `null`），不互相吞掉。合并口径：token / 成本 / 停止原因取回填，`ttftMs` 与 `durationMs` 取 live（live 没有耗时才用 SDK 的 `message.durationMs`）。
+- **P1｜覆盖率显式暴露**。回填 summary 新增 `coverage{imported, eligible, remaining}`：底栏 tooltip 与看板顶部写「已导入 X/M 个会话文件」，`truncated`（批次没扫完）时用 `host.schedule` 隔 2 秒自动续批，UI 标「导入中…」并给「停止导入」按钮（`POST /api/backfill/stop`）。`truncated` 现在看**进度**而不是只看批次数，扫完就自动转 false。
+- **P1｜数字自证**。`scripts/verify-real-sessions.mjs` 内置人工独立复算参考值（7 天：43,470 次 / 5,454,922,553 tokens / $349.7777 / grok-4.7 4,240 次），跑完打印各项偏差（%），偏差 > 2% 以非 0 退出，并区分「文件覆盖不足」与「去重误合并」。
+
+### 升级须知（需重建账本）
+
+- **2.0.0 的历史账本已被污染**（回填记录被错误合并，token / 成本不可信，无法就地修复）。2.0.1 首次激活时**自动重建一次**：丢弃 `source: backfill` 的记录、把「回填 + live」混合记录退回纯 live、清空 `backfill-state.json` 里的文件 offset，然后重新回填会话（会话目录只读，原始数据不丢）。
+- **不需要**手动删 `ledger.jsonl`；迁移只在 `backfill-state.json` 里没有 `ledgerSchema: 2` 时跑一次。重建期间底栏与看板会显示「导入中… X/M」，扫完即恢复正常。
+- 旧 live 记录的 TTFT 保留；它们会与重新回填的记录按 1:1 配对重新补齐 token 与成本。
+
+### 工程
+
+- 单测 167 → 196 条（新增：同毫秒 16 次调用不合并、`sessionFile` 进身份键、1 条回填 vs 3 条同毫秒 live、3 条回填 vs 1 条 live、配对窗口与贪心取最近、配对后重启仍一条、账本重建、覆盖率与续批、客户端覆盖率渲染）。
+- `callsChart`（含 `yGoodTop`）与 `tests/unit/usage-ledger-chart-baseline.test.ts` 未改动；权限仍为 `["ui", "storage", "http", "fs:read"]`。
+
 ## 2.0.0 — 记录 pi-web-ui 自己的模型调用（破坏性）
 
 ### 破坏性变更

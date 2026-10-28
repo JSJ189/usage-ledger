@@ -7,15 +7,20 @@
  *  1. **实时**（`host.onRunEvent`，见 lib/live.mjs）：TTFT 只能这样拿到；
  *  2. **回填**（`~/.pi/agent/sessions/**\/*.jsonl`，见 lib/sessions.mjs）：
  *     逐轮 token、真实成本（SDK `usage.cost.total`）、单次调用耗时。
- *  两路按 `ts + model + provider` / `sessionId + entryId` 合并进自己的账本
- *  （`host.dataDir/ledger.jsonl`，append-only，见 lib/ledger.mjs）。
+ *  两路**不是靠内容键合并**的（2.0.0 的 `ts + model + provider` 去重会把同一毫秒的多次
+ *  真实调用合并成一条，2.0.1 已修）：
+ *   - 回填身份 = `sessionFile + entry.id`（会话里每个 assistant 行唯一）；
+ *   - live 身份 = `conversationId + turnStartAt`；
+ *   - live 与回填靠 **1:1 贪心配对**合并（同 model / 同 provider / |Δts| ≤ 3s，各只能认领一次）。
+ *  账本是 `host.dataDir/ledger.jsonl`（append-only，见 lib/ledger.mjs）。
  *
  * 对外路由（浏览器侧只走这些，全部 200 + `ok:false` 降级，不刷红）：
  *  - `GET  /api/summary?window=&model=`          指标卡 + 按模型汇总
  *  - `GET  /api/series?window=&model=&bucket=`    趋势（hour | day）
  *  - `GET  /api/records?window=&model=&status=&page=&pageSize=`
- *  - `GET  /api/meta`                             账本/回填/授权状态
- *  - `POST /api/backfill`                         立刻跑一次增量回填
+ *  - `GET  /api/meta`                             账本/回填/授权/覆盖率状态
+ *  - `POST /api/backfill`                         立刻跑一次增量回填（会清掉「停止」标记）
+ *  - `POST /api/backfill/stop`                    停止自动续批导入
  *  - `POST /api/grant`                            申请 sessions 目录读取（宿主弹窗）
  *
  * 降级：拿不到 `fs:read` 或用户拒绝授权 → 只采 live（无 token，展示 `--`），
@@ -24,7 +29,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createLedgerStore, LEDGER_FILE, RECORD_STATUS } from "./lib/ledger.mjs";
+import { createLedgerStore, LEDGER_FILE, LEDGER_SCHEMA, RECORD_STATUS } from "./lib/ledger.mjs";
 import {
 	BACKFILL_STATE_FILE,
 	createSessionImporter,
@@ -44,6 +49,10 @@ const BADGE_INTERVAL_MS = 60_000;
 const BACKFILL_INTERVAL_MS = 300_000;
 /** 回填失败后的冷却，防重试风暴。 */
 const FAIL_COOLDOWN_MS = 30_000;
+/** 批次没扫完（truncated）时自动续批的间隔（brief 要求 2 秒）。 */
+const BACKFILL_CONTINUE_MS = 2000;
+/** 自动续批轮数上限（防病态情况下无限循环）。 */
+const MAX_CONTINUE_ROUNDS = 500;
 
 function fmtInt(n) {
 	const v = Number(n);
@@ -165,6 +174,7 @@ export function createStatsService(options = {}) {
 	}
 
 	function baseMeta(win, extra = {}) {
+		const backfill = importer?.summary(lastBackfill) ?? null;
 		return {
 			window: win.key,
 			fromMs: win.fromMs,
@@ -175,7 +185,10 @@ export function createStatsService(options = {}) {
 			sessionsRoot: importer?.root ?? resolveSessionsRoot({ settings: options.getSettings?.() ?? {} }).root,
 			fsReady: fsUsable(),
 			mode: fsUsable() ? "full" : "live-only",
-			backfill: importer?.summary(lastBackfill) ?? null,
+			backfill,
+			// 覆盖率必须显式暴露：「看着已完成，其实只导了 1/4」是 2.0.0 的坑
+			coverage: backfill?.coverage ?? null,
+			importing: Boolean(backfill?.truncated),
 			backfillError,
 			grant: grantState,
 			live: liveStats(),
@@ -311,19 +324,30 @@ export function createStatsService(options = {}) {
 		const records = store.query({ fromMs: win.fromMs, toMs: win.toMs });
 		const summary = metrics.summarize(records);
 		const liveOnly = !fsUsable();
+		const backfill = importer?.summary(lastBackfill) ?? null;
+		const coverage = backfill?.coverage ?? null;
+		// 覆盖率进 tooltip：不能让用户抱着「已经导完了」的前提看数字
+		const covZh =
+			coverage && coverage.eligible > 0
+				? `，已导入 ${coverage.imported}/${coverage.eligible} 个会话文件${backfill?.truncated ? "（导入中…）" : ""}`
+				: "";
+		const covEn =
+			coverage && coverage.eligible > 0
+				? `, imported ${coverage.imported}/${coverage.eligible} session files${backfill?.truncated ? " (importing…)" : ""}`
+				: "";
 		const body = liveOnly
 			? "仅实时"
 			: `${fmtInt(summary.calls)}/${summary.ttft.p50 === null ? "--" : fmtMs(summary.ttft.p50)}`;
 		const tail = liveOnly
 			? "（没有 fs:read：只采实时事件，token 与成本为 --；点开看板可授权导入历史）"
-			: `，失败 ${summary.failed}，TTFT p50 ${summary.ttft.p50 === null ? "--" : fmtMs(summary.ttft.p50)}，平均延迟 ${summary.latencyAvg === null ? "--" : fmtMs(summary.latencyAvg)}，输出 ${fmtInt(summary.tokens.output)} tokens，成本 ${summary.cost.amount === null ? "--" : `$${summary.cost.amount.toFixed(4)}`}`;
+			: `，失败 ${summary.failed}，TTFT p50 ${summary.ttft.p50 === null ? "--" : fmtMs(summary.ttft.p50)}，平均延迟 ${summary.latencyAvg === null ? "--" : fmtMs(summary.latencyAvg)}，输出 ${fmtInt(summary.tokens.output)} tokens，成本 ${summary.cost.amount === null ? "--" : `$${summary.cost.amount.toFixed(4)}`}${covZh}`;
 		return {
 			label: "用量账本",
 			badge: body,
 			hint: `📊 今日模型用量：${summary.calls} 次调用${tail}`,
 			hintEn: liveOnly
 				? "📊 Today's model usage: live-only (no fs:read; tokens and cost show --). Open the dashboard to authorize history import."
-				: `📊 Today's model usage: ${summary.calls} calls, ${summary.failed} failed, TTFT p50 ${summary.ttft.p50 === null ? "--" : fmtMs(summary.ttft.p50)}, avg latency ${summary.latencyAvg === null ? "--" : fmtMs(summary.latencyAvg)}, output ${fmtInt(summary.tokens.output)} tokens, cost ${summary.cost.amount === null ? "--" : `$${summary.cost.amount.toFixed(4)}`}`,
+				: `📊 Today's model usage: ${summary.calls} calls, ${summary.failed} failed, TTFT p50 ${summary.ttft.p50 === null ? "--" : fmtMs(summary.ttft.p50)}, avg latency ${summary.latencyAvg === null ? "--" : fmtMs(summary.latencyAvg)}, output ${fmtInt(summary.tokens.output)} tokens, cost ${summary.cost.amount === null ? "--" : `$${summary.cost.amount.toFixed(4)}`}${covEn}`,
 		};
 	}
 
@@ -368,6 +392,25 @@ export function activate(host) {
 	const stateStore = createStateStore({ dir: dataDir, file: BACKFILL_STATE_FILE, log });
 	const state = stateStore.load();
 
+	// 2.0.0 → 2.0.1 一次性账本重建：
+	// 2.0.0 拿 `ts + model + provider` 给回填记录去重，同一毫秒的多次真实调用被折叠成一条，
+	// 那些记录的 token / 成本已经不可信且无法就地修复 → 丢弃回填来源记录、清掉回填 offset
+	// 让下一次回填重新导入。live 记录保留（真实调用数靠它们），只抖掉从回填带进来的字段。
+	if (Number(state.ledgerSchema) !== LEDGER_SCHEMA) {
+		try {
+			const rebuilt = store.rebuild();
+			state.files = {};
+			state.ledgerSchema = LEDGER_SCHEMA;
+			stateStore.save(state);
+			log(
+				"info",
+				`账本已重建（2.0.1 修复回填去重）：丢弃回填记录 ${rebuilt.dropped} 条，重置实时记录 ${rebuilt.reset} 条；会话文件 offset 已清零，将重新导入`,
+			);
+		} catch (err) {
+			log("warn", "账本重建失败（按原账本继续）：", String(err?.message ?? err));
+		}
+	}
+
 	const buildImporter = () => {
 		const settings = settingsOf();
 		return createSessionImporter({
@@ -392,6 +435,57 @@ export function activate(host) {
 
 	const disposers = [];
 
+	// ── 回填自动续批：批次没扫完（truncated）时隔 2 秒再跑一批，直到扫完或用户停止
+	let continueOff = null;
+	let continueRounds = 0;
+	let continueStopped = false;
+
+	function stopContinue() {
+		if (!continueOff) return;
+		try {
+			continueOff();
+		} catch {
+			/* 幂等清理 */
+		}
+		continueOff = null;
+	}
+
+	/** 用户主动停止：不再续批（下次手动回填会清掉标记）。 */
+	function stopBackfill() {
+		continueStopped = true;
+		continueRounds = 0;
+		stopContinue();
+		refreshBadge();
+		return { ok: true, stopped: true };
+	}
+
+	function scheduleContinue() {
+		if (continueOff || continueStopped) return;
+		if (typeof host.schedule !== "function") return;
+		if (continueRounds >= MAX_CONTINUE_ROUNDS) {
+			log("warn", `回填续批已达上限 ${MAX_CONTINUE_ROUNDS} 轮，停止（下次定时或手动回填会继续）`);
+			return;
+		}
+		continueOff = host.schedule?.(
+			BACKFILL_CONTINUE_MS,
+			() => {
+				continueRounds++;
+				void (async () => {
+					const res = await syncNow();
+					if (!res?.truncated) {
+						continueRounds = 0;
+						stopContinue();
+					}
+				})();
+			},
+			{ id: "usage-ledger-backfill-continue", label: "用量账本继续导入会话文件" },
+		);
+		if (typeof continueOff === "function") {
+			// 不往 disposers 里携：自动摘除由 syncNow / stopContinue 负责，避免长跑时数组无限变长
+			log("debug", `回填续批已安排（第 ${continueRounds + 1} 轮）`);
+		} else continueOff = null;
+	}
+
 	/** 刷新底栏徽标。 */
 	function refreshBadge() {
 		try {
@@ -401,14 +495,26 @@ export function activate(host) {
 		}
 	}
 
-	/** 回填 + 刷徽标（一切失败都只记日志）。 */
+	/** 回填 + 刷徽标（一切失败都只记日志）。返回本次回填统计（没有则 null）。 */
 	async function syncNow({ force = false } = {}) {
+		let res = null;
 		try {
-			await service.runBackfill({ force });
+			res = await service.runBackfill({ force });
 		} catch (err) {
 			log("warn", "回填异常：", String(err?.message ?? err));
 		}
 		refreshBadge();
+		const summary = service.lastBackfill();
+		// 回填没真跑（未授权 / 冷却 / 无 importer）时不续批，否则会拿旧 summary 死循环
+		const skipped = !res || res.ok === false;
+		const truncated = !skipped && summary?.truncated === true;
+		// 没扫完就自己接着扫：宁可多跑几批，也不能「看着已导完」
+		if (truncated) scheduleContinue();
+		else {
+			continueRounds = 0;
+			stopContinue();
+		}
+		return { ...(res ?? {}), truncated, coverage: summary?.coverage ?? null };
 	}
 
 	// ── 实时采集
@@ -460,17 +566,21 @@ export function activate(host) {
 			"POST",
 			"/api/backfill",
 			guard(async () => {
-				const res = await service.runBackfill({ force: true });
-				refreshBadge();
+				// 手动回填 = 从头续上（清掉「停止导入」标记）
+				continueStopped = false;
+				const res = await syncNow({ force: true });
 				return { ok: res.ok !== false, backfill: slim(res), meta: service.meta().meta };
 			}),
 		);
+		host.route("POST", "/api/backfill/stop", guard(() => ({ ...stopBackfill(), meta: service.meta().meta })));
 		host.route(
 			"POST",
 			"/api/grant",
 			guard(async () => {
 				const out = await service.requestAccess({ requestFn: host.fs?.requestAccess });
 				refreshBadge();
+				continueStopped = false;
+				if (service.lastBackfill()?.truncated) scheduleContinue();
 				return { ...out, backfill: slim(out.backfill), meta: service.meta().meta };
 			}),
 		);
@@ -515,7 +625,9 @@ export function activate(host) {
 				const backfill = service.lastBackfill();
 				if (!st.fsReady) return { alive: true, status: `仅实时（无 fs:read） · 账本 ${st.records} 条` };
 				const last = backfill?.finishedAt ? new Date(backfill.finishedAt).toISOString().slice(11, 19) : "未跑";
-				return { alive: true, status: `账本 ${st.records} 条 · 上次回填 ${last} · 会话 ${backfill?.files ?? 0} 文件` };
+				const cov = backfill?.coverage ?? null;
+				const covText = cov ? ` · 会话文件 ${cov.imported}/${cov.eligible}${backfill?.truncated ? "（导入中…）" : ""}` : "";
+				return { alive: true, status: `账本 ${st.records} 条 · 上次回填 ${last}${covText}` };
 			},
 		});
 	} catch (err) {
@@ -543,6 +655,7 @@ export function activate(host) {
 	}
 
 	return () => {
+		stopContinue();
 		for (const off of disposers.splice(0)) {
 			try {
 				off();

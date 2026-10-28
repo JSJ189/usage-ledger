@@ -20,6 +20,8 @@ interface FetchCall {
 const state = {
 	calls: [] as FetchCall[],
 	failMode: "ok" as "ok" | "empty" | "network" | "live-only",
+	coverage: null as null | { imported: number; eligible: number; remaining: number },
+	truncated: false,
 };
 
 const RECORD_TS = new Date(2026, 9, 27, 1, 2, 3).getTime();
@@ -166,7 +168,16 @@ function metaPayload() {
 			sessionsRoot: "C:\\Users\\me\\.pi\\agent\\sessions",
 			fsReady: !liveOnly,
 			mode: liveOnly ? "live-only" : "full",
-			backfill: { files: 12, records: 45, finishedAt: RECORD_TS, errors: [] },
+			backfill: {
+				files: 12,
+				records: 45,
+				finishedAt: RECORD_TS,
+				errors: [],
+				coverage: state.coverage,
+				truncated: state.truncated,
+			},
+			coverage: state.coverage,
+			importing: state.truncated,
 			backfillError: null,
 			grant: liveOnly
 				? {
@@ -256,6 +267,8 @@ afterEach(() => {
 	vi.unstubAllGlobals();
 	state.calls.length = 0;
 	state.failMode = "ok";
+	state.coverage = null;
+	state.truncated = false;
 	document.body.innerHTML = "";
 	document.getElementById("usage-ledger-styles")?.remove();
 });
@@ -554,5 +567,52 @@ describe("纯函数：图表与格式化", () => {
 			expect(d.grant).toBeTruthy();
 			expect(d.empty).toBeTruthy();
 		}
+	});
+});
+
+describe("文件覆盖率必须可见（2.0.1）", () => {
+	it("顶部显示「已导入 X/M 个会话文件」，导入中给「导入中…」与停止按钮", async () => {
+		state.coverage = { imported: 3, eligible: 12, remaining: 9 };
+		state.truncated = true;
+		stubFetch();
+		const { container, cleanup } = mountDashboard();
+		await vi.waitFor(() =>
+			expect(container.querySelector(".cps-meta")?.textContent ?? "").toContain("已导入 3/12 个会话文件"),
+		);
+		const metaLine = container.querySelector(".cps-meta")?.textContent ?? "";
+		expect(metaLine).toContain("导入中…");
+		const stop = container.querySelector("[data-act='stopImport']");
+		expect(stop?.textContent).toContain("停止导入");
+		cleanup();
+		container.remove();
+	});
+
+	it("导完了就不再写「导入中…」，也不留停止按钮", async () => {
+		state.coverage = { imported: 12, eligible: 12, remaining: 0 };
+		state.truncated = false;
+		stubFetch();
+		const { container, cleanup } = mountDashboard();
+		await vi.waitFor(() =>
+			expect(container.querySelector(".cps-meta")?.textContent ?? "").toContain("已导入 12/12 个会话文件"),
+		);
+		const metaLine = container.querySelector(".cps-meta")?.textContent ?? "";
+		expect(metaLine).not.toContain("导入中…");
+		expect(container.querySelector("[data-act='stopImport']")).toBeNull();
+		cleanup();
+		container.remove();
+	});
+
+	it("点「停止导入」会 POST /api/backfill/stop", async () => {
+		state.coverage = { imported: 3, eligible: 12, remaining: 9 };
+		state.truncated = true;
+		stubFetch();
+		const { container, cleanup } = mountDashboard();
+		await vi.waitFor(() => expect(container.querySelector("[data-act='stopImport']")).toBeTruthy(), { timeout: 3000 });
+		(container.querySelector("[data-act='stopImport']") as HTMLElement).click();
+		await vi.waitFor(() =>
+			expect(state.calls.some((c) => c.url.includes("/api/backfill/stop") && c.method === "POST")).toBe(true),
+		);
+		cleanup();
+		container.remove();
 	});
 });

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/JSJ189/usage-ledger/actions/workflows/ci.yml/badge.svg)](https://github.com/JSJ189/usage-ledger/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![manifest](https://img.shields.io/badge/manifest-2.0.0-informational)
+![manifest](https://img.shields.io/badge/manifest-2.0.1-informational)
 ![permissions](https://img.shields.io/badge/permissions-ui%20%7C%20storage%20%7C%20http%20%7C%20fs%3Aread-brightgreen)
 
 pi-web-ui 界面插件：记录 **pi-web-ui 自己发出的每一次模型调用**，按模型统计调用数、成功率、TTFT 分位、单次耗时、输出速率、token 用量与**真实成本**（SDK 的 `usage.cost.total`，不估算）。底栏常驻「今日调用数 / TTFT p50」，点击打开看板。
@@ -15,7 +15,7 @@ pi-web-ui 界面插件：记录 **pi-web-ui 自己发出的每一次模型调用
 | token（输入/输出/缓存读/缓存写/推理） | 会话 JSONL 的 `message.usage` | 可回填历史 |
 | 真实成本 USD | 会话 JSONL 的 `message.usage.cost.total` | 与宿主显示的数字同源 |
 | 单次调用耗时 | 会话 JSONL 的 `message.durationMs`；无则用 turn 时长 | 可回填历史 |
-| 模型 / provider / 停止原因 | 会话 JSONL + `message` 运行事件 | 两路合并去重 |
+| 模型 / provider / 停止原因 | 会话 JSONL + `message` 运行事件 | 两路按「同一次调用」1:1 配对 |
 
 ## 安装
 
@@ -43,14 +43,20 @@ pi-web-ui install JSJ189/usage-ledger
 
 `<host.dataDir>/ledger.jsonl`（一行一条记录，append-only，崩溃最多丢最后一行）。
 
-- 每条记录：`ts | conversationId | projectDir | provider | model | thinkingLevel | inputTokens | outputTokens | cacheReadTokens | cacheWriteTokens | reasoningTokens | totalTokens | costUsd | durationMs | ttftMs | stopReason | status | source(live|backfill) | sources[]`。
-- 去重：`sessionId + entryId`（回填天然唯一）或 `ts + model + provider`（实时与回填的交集，会话里 `message.timestamp` 与 `UiMessage.timestamp` 是同一个 SDK 值）。同一调用两边各来一次会**合并成一条**，不会翻倍。
+- 每条记录：`ts | conversationId | projectDir | provider | model | thinkingLevel | inputTokens | outputTokens | cacheReadTokens | cacheWriteTokens | reasoningTokens | totalTokens | costUsd | durationMs | ttftMs | stopReason | status | source(live|backfill) | sources[] | sessionFile | entryId | paired`。
+- **身份键与配对是两件事**（2.0.1 修复）：
+  - 回填记录的身份键**只有** `sessionFile + entry.id`（会话里每个 assistant 行的 `id` 唯一，一次调用一行）。**不用** `ts + model + provider` 去重：同一毫秒内多次调用（并行 / 子代理）真实存在，那样会把几十次真实调用合并成一条。
+  - live 记录的身份键是 `conversationId + turnStartAt`（一个对话同一时刻只有一个 turn）。
+  - live（有 TTFT、没 token）与回填（有 token、没 TTFT）是同一调用的两半，靠 **1:1 贪心配对**合并：同 `model` + 同 `provider` + `|Δts| ≤ 3000ms`，取 ts 最接近的一条；每条 live 最多认领一条回填，反过来也一样（认领过就带 `paired` 标记）。配不上就各自保留（live 只算实时那次、回填 TTFT 为 `null`），**绝不互相吞掉**。
+  - 配对口径：token / 成本 / 停止原因取回填；`ttftMs` 只取 live；`durationMs` 取 live（`turn_start`→`turn_end` 实测耗时），live 没有才用回填的 `message.durationMs`；状态以「非 incomplete 的真实结局」为准。
 - 回填进度存在 `<host.dataDir>/backfill-state.json`：每个文件的 `{mtime, size, offset, unit, ctx}`，下次只读新增字节。
+- **升级到 2.0.1 会重建一次账本**：2.0.0 用 `ts + model + provider` 去重，历史回填记录的 token / 成本已被错误合并、无法就地修复。激活时自动丢弃 `source: backfill` 的记录、清空回填 offset、把「回填 + live」混合记录退回纯 live，然后重新回填（会话目录只读，数据不丢，只是重算一遍）。**不需要**手动删 `ledger.jsonl`。
 
 ## 回填（导入历史）
 
 - 位置：设置项 `sessionsDir` → `$PI_CODING_AGENT_DIR/sessions` → `~/.pi/agent/sessions`。
 - 范围：只回填 `mtime` 在 `backfillDays`（默认 30，夹取 1–3650）内的文件；单次最多 200 个文件（按 mtime 新→旧）、单文件超过 100MB 跳过并记日志；每处理一个文件让出一次事件循环。
+- **覆盖率显式暴露**：批次没扫完（`truncated`）时自动隔 2 秒续批，直到扫完或用户在看板点「停止导入」；底栏 tooltip 与看板顶部始终写「已导入 X/M 个会话文件」，导入中额外标「导入中…」。不允许「看起来已完成，其实只导了 1/4」。
 - 触发：激活时一次（`backfillOnStart` 可关）、每 5 分钟一次增量、看板「回填」按钮、授权成功后立刻一次。
 - 只读：全程走 `host.fs` 的跨目录读接口，插件不会写这个目录。
 
@@ -77,8 +83,9 @@ pi-web-ui install JSJ189/usage-ledger
 | `GET /api/summary?window=&model=` | 指标卡 + 按模型汇总。`window` = `today` / `7d` / `30d` / `all` |
 | `GET /api/series?window=&model=&bucket=` | 趋势，`bucket` = `hour` / `day` |
 | `GET /api/records?window=&model=&status=&page=&pageSize=` | 记录明细（分页，最新在前） |
-| `GET /api/meta` | 账本规模、会话目录、上次回填、授权状态 |
-| `POST /api/backfill` | 立刻跑一次增量回填 |
+| `GET /api/meta` | 账本规模、会话目录、上次回填（含 `coverage{imported,eligible,remaining}` 与 `importing`）、授权状态 |
+| `POST /api/backfill` | 立刻跑一次增量回填（会清掉「停止导入」标记） |
+| `POST /api/backfill/stop` | 停止自动续批导入 |
 | `POST /api/grant` | 申请 `sessions` 目录读取（宿主弹窗），成功后自动回填 |
 
 ## 设置项
@@ -99,8 +106,10 @@ pi-web-ui install JSJ189/usage-ledger
 npm ci
 npm test                     # vitest：账本/会话/聚合/实时/看板 单测
 npm run check                # manifest 自检（字段、权限、版本、残留检查）
-npm run verify:sessions      # 拿真实的 ~/.pi/agent/sessions 跑一遍只读回填，打印条数与总成本
+npm run verify:sessions -- 7 # 拿真实的 ~/.pi/agent/sessions 跑一遍只读回填，并与独立复算对照
 ```
+
+`verify-real-sessions.mjs` 里有一个人工独立复算的参考值（Python 直扫会话 JSONL，不经过本插件代码）：脚本会打印调用数 / token / 成本 / 每模型调用数与参考值的偏差（%），偏差 > 2% 时以非 0 退出，并区分「文件覆盖不足」与「去重误合并」。参考值只在 7 天窗口有效。
 
 单测不触碰真实会话目录：会话 fixture 与 `host.fs` 替身在 `tests/support/`。
 

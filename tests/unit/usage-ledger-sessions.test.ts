@@ -447,3 +447,76 @@ describe("createSessionImporter：枚举与增量", () => {
 		expect(summary.errors).toEqual([]);
 	});
 });
+
+describe("P0：回填身份 = 会话文件 + entry id", () => {
+	it("每条回填记录都带 sessionFile（跨会话同名 entry id 不撞车）", async () => {
+		const root = makeTmpDir("ul-identity-");
+		writeSessionFile(root, "--p-a--", "a.jsonl", [sessionHeader({ id: "s-a" }), assistantLine({ id: "a1" })]);
+		writeSessionFile(root, "--p-b--", "b.jsonl", [sessionHeader({ id: "s-b" }), assistantLine({ id: "a1" })]);
+		const { importer } = importerFor(root);
+		const res = await importer.run();
+		expect(res.records.length).toBe(2);
+		const files = res.records.map((r) => r.sessionFile).sort();
+		expect(files.every((f) => typeof f === "string" && f.endsWith(".jsonl"))).toBe(true);
+		expect(new Set(files).size).toBe(2);
+		expect(res.records.map((r) => r.entryId)).toEqual(["a1", "a1"]);
+	});
+
+	it("同一毫秒同 model 的多条 assistant 行都保留（不再被 ts+model+provider 合并）", async () => {
+		const root = makeTmpDir("ul-same-ms-");
+		const lines = [sessionHeader()];
+		for (let i = 0; i < 5; i++) lines.push(assistantLine({ id: `a${i}`, ts: 1_792_493_011_970 }));
+		writeSessionFile(root, "--p--", "s.jsonl", lines);
+		const { importer } = importerFor(root);
+		const res = await importer.run();
+		expect(res.records.length).toBe(5);
+		expect(new Set(res.records.map((r) => r.entryId)).size).toBe(5);
+	});
+
+	it("assistant 行没有 id 时按出现顺序合成稳定序号（~1 / ~2）", () => {
+		const ctx: Record<string, unknown> = { sessionFile: "C:/sessions/x.jsonl" };
+		const text = jsonl([sessionHeader(), assistantLine({ id: null }), assistantLine({ id: null })]);
+		const parsed = parseSessionText(text, ctx);
+		expect(parsed.records.map((r) => r.entryId)).toEqual(["~1", "~2"]);
+		expect(parsed.records[0].sessionFile).toBe("C:/sessions/x.jsonl");
+	});
+});
+
+describe("覆盖率：已导入 X/M 个会话文件", () => {
+	it("一次跑完：coverage.imported === eligible，truncated=false", async () => {
+		const { root } = makeSessionTree({ projects: 1, filesPerProject: 3 });
+		const { importer } = importerFor(root);
+		const res = await importer.run();
+		expect(res.coverage).toEqual({ imported: 3, eligible: 3, remaining: 0 });
+		expect(res.truncated).toBe(false);
+	});
+
+	it("批次没扫完：remaining > 0 且 truncated=true（续批后归零）", async () => {
+		const { root } = makeSessionTree({ projects: 1, filesPerProject: 3 });
+		const scanned = (await importerFor(root).importer.scan()).files;
+		setMtime(scanned[0].path, Date.now() - 1 * DAY);
+		setMtime(scanned[1].path, Date.now() - 2 * DAY);
+		setMtime(scanned[2].path, Date.now() - 3 * DAY);
+		const { importer } = importerFor(root, { maxFilesPerRun: 2 });
+		const first = await importer.run();
+		expect(first.coverage).toEqual({ imported: 2, eligible: 3, remaining: 1 });
+		expect(first.truncated).toBe(true);
+		const second = await importer.run();
+		expect(second.coverage).toEqual({ imported: 3, eligible: 3, remaining: 0 });
+		expect(second.truncated).toBe(false);
+	});
+
+	it("过老 / 过大的文件不计入 eligible（不该拖累覆盖率）", async () => {
+		const root = makeTmpDir("ul-coverage-");
+		writeSessionFile(root, "--p--", "fresh.jsonl", [sessionHeader(), assistantLine({ id: "a1" })]);
+		writeSessionFile(root, "--p--", "old.jsonl", [sessionHeader(), assistantLine({ id: "a2" })]);
+		const scanned = (await importerFor(root).importer.scan()).files;
+		const oldFile = scanned.find((f) => f.path.endsWith("old.jsonl"));
+		setMtime(oldFile.path, Date.now() - 30 * DAY);
+		const { importer } = importerFor(root, { days: 7 });
+		const res = await importer.run();
+		expect(res.coverage.eligible).toBe(1);
+		expect(res.coverage.imported).toBe(1);
+		expect(res.skipped.tooOld).toBe(1);
+	});
+});

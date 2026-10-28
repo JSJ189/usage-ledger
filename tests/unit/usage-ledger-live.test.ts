@@ -6,11 +6,12 @@
  *     （TTFT 只认第一包、缺 message 标 incomplete、run_end 兜底）；
  *  2. `activate(host)`：订阅 / 路由 / 徽标 / 定时 / 降级 / 授权 / 与回填的去重。
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createLiveCollector } from "../../lib/live.mjs";
 import { createLedgerStore, LEDGER_FILE } from "../../lib/ledger.mjs";
+import { BACKFILL_STATE_FILE } from "../../lib/sessions.mjs"
 import { activate } from "../../index.mjs";
 import { createMockHost } from "../support/mock-host.mjs";
 import { createMockFs } from "../support/mock-fs.mjs";
@@ -248,7 +249,7 @@ afterEach(() => {
 });
 
 describe("activate：装配、订阅、降级", () => {
-	it("订阅 onRunEvent 并注册 4 个数据路由 + 2 个 POST 动作", () => {
+	it("订阅 onRunEvent 并注册 4 个数据路由 + 3 个 POST 动作", () => {
 		const { host } = makeHost();
 		boot(host);
 		expect(host.mock.handlers.onRunEvent?.length).toBe(1);
@@ -259,6 +260,7 @@ describe("activate：装配、订阅、降级", () => {
 			"GET /api/series",
 			"GET /api/summary",
 			"POST /api/backfill",
+			"POST /api/backfill/stop",
 			"POST /api/grant",
 		]);
 	});
@@ -342,7 +344,7 @@ describe("activate：装配、订阅、降级", () => {
 		expect(summary.summary.ttft.samples).toBe(0);
 	});
 
-	it("回填 + live 同一次调用只留一条（ts+model+provider 合并）", async () => {
+	it("回填 + live 同一次调用只留一条（1:1 配对：token 取回填、TTFT 取 live）", async () => {
 		const ts = 1_791_774_070_834;
 		const root = makeTmpDir("ul-both-");
 		writeSessionFile(root, "--p--", "s.jsonl", [
@@ -504,5 +506,94 @@ describe("activate：装配、订阅、降级", () => {
 		expect(hourly.series[0].hour).toMatch(/T\d{2}:00:00$/);
 		const daily = await callRoute(host, "GET", "/api/series", { window: "all", bucket: "day" });
 		expect(daily.series[0].hour).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+	});
+});
+
+describe("activate：覆盖率、续批与 2.0.1 账本迁移", () => {
+	const scheduleIds = (host) => host.mock.schedules.map((s) => s.opts?.id);
+
+	it("meta 暴露文件覆盖率（已导入 X/M 个会话文件）与 importing 标记", async () => {
+		const tree = makeSessionTree({ projects: 1, filesPerProject: 2 });
+		const { host } = makeHost({ fs: createMockFs(), settings: { sessionsDir: tree.root } });
+		boot(host);
+		await flush();
+		const meta = (await callRoute(host, "GET", "/api/meta")).meta;
+		expect(meta.coverage).toEqual({ imported: 2, eligible: 2, remaining: 0 });
+		expect(meta.importing).toBe(false);
+	});
+
+	it("徽标 tooltip 带文件覆盖率（不让用户以为已经导完）", async () => {
+		const tree = makeSessionTree();
+		const { host } = makeHost({ fs: createMockFs(), settings: { sessionsDir: tree.root } });
+		boot(host);
+		await flush();
+		const patch = host.mock.lastUiUpdate("usage-ledger-badge");
+		expect(patch.hint).toContain("已导入 1/1 个会话文件");
+	});
+
+	it("批次没扫完就自动续批：扫完后 importing 转 false 并摘掉续批定时任务", async () => {
+		const tree = makeSessionTree({ projects: 1, filesPerProject: 201 });
+		const { host } = makeHost({ fs: createMockFs(), settings: { sessionsDir: tree.root } });
+		boot(host);
+		await flush();
+		expect(scheduleIds(host)).toContain("usage-ledger-backfill-continue");
+		const before = (await callRoute(host, "GET", "/api/meta")).meta;
+		expect(before.importing).toBe(true);
+		expect(before.coverage.eligible).toBe(201);
+		expect(before.coverage.imported).toBe(200);
+		// 触发续批：下一批把剩下 1 个扫完
+		await host.mock.fireSchedules();
+		await flush(20);
+		const after = (await callRoute(host, "GET", "/api/meta")).meta;
+		expect(after.coverage).toEqual({ imported: 201, eligible: 201, remaining: 0 });
+		expect(after.importing).toBe(false);
+		expect(scheduleIds(host)).not.toContain("usage-ledger-backfill-continue");
+	});
+
+	it("POST /api/backfill/stop：用户停止后不再续批", async () => {
+		const tree = makeSessionTree({ projects: 1, filesPerProject: 201 });
+		const { host } = makeHost({ fs: createMockFs(), settings: { sessionsDir: tree.root } });
+		boot(host);
+		await flush();
+		expect(scheduleIds(host)).toContain("usage-ledger-backfill-continue");
+		const stopped = await callRoute(host, "POST", "/api/backfill/stop");
+		expect(stopped.ok).toBe(true);
+		expect(scheduleIds(host)).not.toContain("usage-ledger-backfill-continue");
+	});
+
+	it("升级到 2.0.1：污染的 2.0.0 账本被重建（回填记录丢弃、offset 清零重新导入）", async () => {
+		const tree = makeSessionTree();
+		const { host, dataDir } = makeHost({ fs: createMockFs(), settings: { sessionsDir: tree.root } });
+		// 2.0.0 留下的污染记录：把多次真实调用折叠成一条，成本是假的 9 美元
+		const polluted = {
+			ts: 1_792_493_011_970,
+			sessionId: "sess-1",
+			entryId: "a1",
+			provider: "cliproxyapi",
+			model: "grok-4.7",
+			inputTokens: 1,
+			outputTokens: 1,
+			totalTokens: 2,
+			costUsd: 9,
+			status: "ok",
+			source: "backfill",
+			id: "e:sess-1:a1",
+			sources: ["backfill"],
+		};
+		writeFileSync(join(dataDir, LEDGER_FILE), `${JSON.stringify(polluted)}\n`, "utf8");
+		// 老版本的状态文件（没有 ledgerSchema，offset 已到文件尾 → 不重建就不会重读）
+		writeFileSync(join(dataDir, BACKFILL_STATE_FILE), JSON.stringify({ version: 1, root: tree.root, files: {} }), "utf8");
+		boot(host);
+		await flush();
+		const meta = (await callRoute(host, "GET", "/api/meta")).meta;
+		expect(meta.ledger.records).toBe(1);
+		const rows = (await callRoute(host, "GET", "/api/records", { window: "all" })).records;
+		expect(rows.length).toBe(1);
+		// 假数字被清掉，换成会话里真实的一条调用
+		expect(rows[0].costUsd).toBeCloseTo(0.020144, 6);
+		expect(rows[0].totalTokens).toBe(9286);
+		// 迁移只跑一次：状态文件里记了 ledgerSchema
+		const state = JSON.parse(readFileSync(join(dataDir, BACKFILL_STATE_FILE), "utf8"));
+		expect(Number(state.ledgerSchema)).toBe(2);
 	});
 });

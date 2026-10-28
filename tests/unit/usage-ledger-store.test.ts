@@ -176,9 +176,13 @@ describe("mergeRecord：回填与 live 合并语义", () => {
 		expect(merged.sources).toEqual(["backfill", "live"]);
 	});
 
-	it("id 保持先到者的稳定 id", () => {
+	it("id 优先保留 entry 身份（回填稳定 id，跨重启不变）", () => {
 		const merged = mergeRecord(normalizeRecord(LIVE), normalizeRecord(BACKFILL));
-		expect(merged.id).toBe("c:1791774070834:grok-4.7:cliproxyapi");
+		expect(merged.id).toBe("e:sess-1:a1");
+		// 两边都没 entry 身份时才用内容键
+		expect(mergeRecord(normalizeRecord({ ...LIVE, ts: 1 }), normalizeRecord({ ...LIVE, ts: 1 })).id).toBe(
+			"c:1:grok-4.7:cliproxyapi",
+		);
 	});
 });
 
@@ -227,11 +231,12 @@ describe("createLedgerStore：写入 / 折叠 / 容错", () => {
 		expect(store.list().map((r) => r.id)).toEqual(["e:s1:a1", "e:s2:a1"]);
 	});
 
-	it("同一毫秒、同模型、同 provider 的两条记录视为同一次调用（内容键命中即合并）", () => {
+	it("同一毫秒、同模型、同 provider 的两条不同 entry 是两次调用（2.0.0 曾误合并）", () => {
 		const store = createLedgerStore({ dir: tmp() });
 		store.add({ ...BACKFILL, sessionId: "s1", entryId: "a1" });
 		store.add({ ...BACKFILL, sessionId: "s2", entryId: "a1" });
-		expect(store.size).toBe(1);
+		// entry 身份不同 → 两次真实调用，必须各留一条（同毫秒不是同一次调用）
+		expect(store.size).toBe(2);
 	});
 
 	it("落盘文件是 JSONL，一行一条记录", () => {
@@ -316,7 +321,7 @@ describe("createLedgerStore：写入 / 折叠 / 容错", () => {
 	it("addMany 汇总 added / merged / invalid", () => {
 		const store = createLedgerStore({ dir: tmp() });
 		const res = store.addMany([BACKFILL, LIVE, null, "bad"]);
-		expect(res).toEqual({ added: 1, merged: 1, invalid: 2 });
+		expect(res).toEqual({ added: 1, merged: 1, paired: 1, invalid: 2 });
 		expect(store.size).toBe(1);
 	});
 
@@ -342,5 +347,231 @@ describe("createLedgerStore：写入 / 折叠 / 容错", () => {
 		expect(st.path).toBe(join(dir, LEDGER_FILE));
 		expect(st.persistence).toBe(true);
 		expect(existsSync(st.path)).toBe(true);
+	});
+});
+
+// ──────────────────────────────────────────────────────────── P0：2.0.1
+
+const P0_TS = 1_792_493_011_970; // 实测里一条键被 16 次真实调用共用的毫秒
+
+/** 回填记录：身份 = 会话文件 + entry id（同毫秒也能多条，各自独立）。 */
+function backfillOf(entryId: string, extra: Record<string, unknown> = {}) {
+	return {
+		ts: P0_TS,
+		sessionFile: "C:\sessions\--proj--\2026-10-12T03-00-10-854Z_uuid.jsonl",
+		sessionId: "sess-1",
+		entryId,
+		provider: "xiaomi",
+		model: "mimo-v2.6-pro",
+		inputTokens: 1000,
+		outputTokens: 100,
+		totalTokens: 1100,
+		costUsd: 0.5,
+		hasUsage: true,
+		status: "ok",
+		source: RECORD_SOURCES.backfill,
+		...extra,
+	};
+}
+
+/** live 记录：有 TTFT、没 token；身份 = 对话 + turn 起点。 */
+function liveOf(conversationId: string, extra: Record<string, unknown> = {}) {
+	return {
+		ts: P0_TS,
+		conversationId,
+		turnStartAt: P0_TS - 800,
+		provider: "xiaomi",
+		model: "mimo-v2.6-pro",
+		costUsd: 0.5,
+		durationMs: 4000,
+		ttftMs: 700,
+		status: "ok",
+		source: RECORD_SOURCES.live,
+		...extra,
+	};
+}
+
+describe("P0 修复：回填身份唯一（禁止 ts+model+provider 去重）", () => {
+	it("同一毫秒同模型的 16 条真实调用（entryId 各不相同）必须是 16 条记录", () => {
+		const store = createLedgerStore({ dir: tmp() });
+		for (let i = 0; i < 16; i++) store.add(backfillOf(`a${i}`));
+		expect(store.size).toBe(16);
+		expect(store.list().every((r) => r.id.startsWith("e:"))).toBe(true);
+	});
+
+	it("sessionFile 进身份键：同名 entryId 在不同会话文件里不撞车", () => {
+		const store = createLedgerStore({ dir: tmp() });
+		store.add(backfillOf("a1", { sessionFile: "C:\s\one.jsonl" }));
+		store.add(backfillOf("a1", { sessionFile: "C:\s\two.jsonl" }));
+		expect(store.size).toBe(2);
+	});
+
+	it("同一个 entry 重读（同文件同 id）仍然只留一条（增量回填不会翻倍）", () => {
+		const store = createLedgerStore({ dir: tmp() });
+		store.add(backfillOf("a1"));
+		store.add(backfillOf("a1", { outputTokens: 222 }));
+		expect(store.size).toBe(1);
+		expect(store.list()[0].outputTokens).toBe(222);
+	});
+
+	it("没有 entry 身份的回填记录不靠 ts+model+provider 合并（宁可多一条）", () => {
+		const store = createLedgerStore({ dir: tmp() });
+		const noId = { ...backfillOf("x"), entryId: null, sessionFile: null, sessionId: null };
+		store.add(noId);
+		store.add({ ...noId });
+		expect(store.size).toBe(2);
+	});
+});
+
+describe("P0 修复：live ↔ 回填严格 1:1 贪心配对", () => {
+	it("1 条回填 + 3 条同毫秒同模型 live：只配对一条，另两条各自独立（绝不塌成 1 条）", () => {
+		const store = createLedgerStore({ dir: tmp() });
+		store.add(backfillOf("a1"));
+		const res = [store.add(liveOf("conv-1")), store.add(liveOf("conv-2")), store.add(liveOf("conv-3"))];
+		expect(store.size).toBe(3);
+		expect(res.filter((r) => r.paired).length).toBe(1);
+		const records = store.list();
+		expect(records.filter((r) => r.paired === true).length).toBe(1);
+		const liveOnly = records.filter((r) => r.paired !== true);
+		expect(liveOnly.length).toBe(2);
+		// 没配上对的那两条：各自保留 TTFT，token 仍是 null（不许被别人的 token 污染）
+		for (const r of liveOnly) {
+			expect(r.ttftMs).toBe(700);
+			expect(r.inputTokens).toBeNull();
+		}
+		expect(store.stats().liveOnly).toBe(2);
+		expect(store.stats().paired).toBe(1);
+	});
+
+	it("3 条回填 + 1 条 live：只配对一条，其余两条的 TTFT 仍是 null", () => {
+		const store = createLedgerStore({ dir: tmp() });
+		store.add(backfillOf("a1"));
+		store.add(backfillOf("a2"));
+		store.add(backfillOf("a3"));
+		const res = store.add(liveOf("conv-1"));
+		expect(res.paired).toBe(true);
+		expect(store.size).toBe(3);
+		const withTtft = store.list().filter((r) => r.ttftMs !== null);
+		expect(withTtft.length).toBe(1);
+		expect(withTtft[0].ttftMs).toBe(700);
+		expect(withTtft[0].inputTokens).toBe(1000);
+		// 没配上对的两条回填：token 在、TTFT 为 null，一条都不能少
+		expect(store.list().filter((r) => r.ttftMs === null).length).toBe(2);
+		expect(store.list().every((r) => r.status === "ok")).toBe(true);
+	});
+
+	it("配对条件：|ts 差| <= 3000ms 配，超出就各自留着", () => {
+		const near = createLedgerStore({ dir: tmp() });
+		near.add(backfillOf("a1"));
+		near.add(liveOf("conv-near", { ts: P0_TS + 3000 }));
+		expect(near.size).toBe(1);
+		const far = createLedgerStore({ dir: tmp() });
+		far.add(backfillOf("a1"));
+		far.add(liveOf("conv-far", { ts: P0_TS + 3001 }));
+		expect(far.size).toBe(2);
+	});
+
+	it("配对条件：model 或 provider 不同就不配", () => {
+		const store = createLedgerStore({ dir: tmp() });
+		store.add(backfillOf("a1"));
+		store.add(liveOf("conv-model", { model: "grok-4.7" }));
+		store.add(liveOf("conv-provider", { provider: "other" }));
+		expect(store.size).toBe(3);
+	});
+
+	it("2 条回填 + 1 条 live：只有一条被认领，另一条不许被吞", () => {
+		const store = createLedgerStore({ dir: tmp() });
+		store.add(backfillOf("a1"));
+		store.add(backfillOf("a2"));
+		store.add(liveOf("conv-1"));
+		expect(store.size).toBe(2);
+		expect(store.list().filter((r) => r.paired === true).length).toBe(1);
+		expect(store.list().filter((r) => r.ttftMs === null).length).toBe(1);
+	});
+
+	it("贪心取最接近的 ts（不是随便一条）", () => {
+		const store = createLedgerStore({ dir: tmp() });
+		store.add(backfillOf("a1", { ts: P0_TS - 2000 }));
+		store.add(backfillOf("a2", { ts: P0_TS }));
+		store.add(liveOf("conv-1", { ts: P0_TS + 100 }));
+		const paired = store.list().find((r) => r.paired === true);
+		expect(paired?.entryId).toBe("a2");
+	});
+
+	it("配对口径：token/成本取回填，TTFT/耗时取 live，状态优先真实结局", () => {
+		const store = createLedgerStore({ dir: tmp() });
+		store.add(backfillOf("a1", { status: "incomplete", hasUsage: false, inputTokens: null, costUsd: null }));
+		store.add(liveOf("conv-1", { durationMs: 4321 }));
+		const only = store.list()[0];
+		expect(store.size).toBe(1);
+		expect(only.ttftMs).toBe(700);
+		expect(only.durationMs).toBe(4321);
+		expect(only.status).toBe("ok");
+		expect(only.paired).toBe(true);
+		expect(only.sources).toEqual(["backfill", "live"]);
+		expect(only.id.startsWith("e:")).toBe(true);
+	});
+
+	it("配对结果落盘后重启仍然是同一条（log-structured 折叠）", () => {
+		const dir = tmp();
+		const store = createLedgerStore({ dir });
+		store.add(backfillOf("a1"));
+		store.add(liveOf("conv-1"));
+		expect(store.size).toBe(1);
+		const reloaded = createLedgerStore({ dir });
+		reloaded.load();
+		expect(reloaded.size).toBe(1);
+		expect(reloaded.list()[0].ttftMs).toBe(700);
+		expect(reloaded.list()[0].inputTokens).toBe(1000);
+		expect(reloaded.list()[0].paired).toBe(true);
+	});
+
+	it("配过对的记录不会被第二条 live 再次认领", () => {
+		const store = createLedgerStore({ dir: tmp() });
+		store.add(liveOf("conv-1"));
+		store.add(backfillOf("a1"));
+		expect(store.size).toBe(1);
+		store.add(liveOf("conv-2"));
+		// conv-2 没有回填可配 → 自己一条，不是并进已配对的那条
+		expect(store.size).toBe(2);
+	});
+});
+
+describe("账本重建（2.0.0 污染数据的一次性迁移）", () => {
+	it("丢弃回填来源记录、把配过对的 live 退回纯 live，并压实文件", () => {
+		const dir = tmp();
+		const store = createLedgerStore({ dir });
+		store.add(backfillOf("a1"));
+		store.add(liveOf("conv-1")); // 与 a1 配对 → 变成「回填 + live」混合记录
+		store.add(backfillOf("a2"));
+		expect(store.size).toBe(2);
+		const rebuilt = store.rebuild();
+		expect(rebuilt.ok).toBe(true);
+		expect(rebuilt.dropped).toBe(1); // a2 是纯回填
+		expect(rebuilt.reset).toBe(1); // 混合记录退回 live
+		const records = store.list();
+		expect(records.length).toBe(1);
+		const only = records[0];
+		expect(only.source).toBe(RECORD_SOURCES.live);
+		expect(only.sources).toEqual(["live"]);
+		expect(only.paired).toBe(false);
+		expect(only.inputTokens).toBeNull();
+		expect(only.costUsd).toBeNull();
+		expect(only.ttftMs).toBe(700);
+		// 文件也重建了：读回来还是 1 条纯 live
+		const reloaded = createLedgerStore({ dir });
+		reloaded.load();
+		expect(reloaded.size).toBe(1);
+		expect(reloaded.list()[0].inputTokens).toBeNull();
+	});
+
+	it("干净账本上 rebuild 是 no-op（不误删、不重复压实）", () => {
+		const store = createLedgerStore({ dir: tmp() });
+		store.add(liveOf("conv-1"));
+		const before = store.stats().compactions;
+		const rebuilt = store.rebuild();
+		expect(rebuilt).toEqual({ ok: true, dropped: 0, reset: 0, kept: 1 });
+		expect(store.size).toBe(1);
+		expect(store.stats().compactions).toBe(before);
 	});
 });

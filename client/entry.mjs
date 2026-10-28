@@ -124,6 +124,10 @@ const ZH = {
 	sessionsRoot: "会话目录",
 	lastBackfill: "上次回填",
 	never: "未跑过",
+	fileCoverage: "已导入",
+	sessionFiles: "个会话文件",
+	importing: "导入中…",
+	stopImport: "停止导入",
 	files: "文件",
 	stopped: "停止原因",
 	unknown: "(未知)",
@@ -221,6 +225,10 @@ const EN = {
 	sessionsRoot: "Sessions",
 	lastBackfill: "Last backfill",
 	never: "never",
+	fileCoverage: "Imported",
+	sessionFiles: "session files",
+	importing: "importing…",
+	stopImport: "Stop importing",
 	files: "files",
 	stopped: "stop reason",
 	unknown: "(unknown)",
@@ -742,14 +750,23 @@ function renderMetaLine(state, d) {
 	const meta = state.meta ?? {};
 	const ledger = meta.ledger ?? {};
 	const backfill = meta.backfill ?? null;
+	const coverage = meta.coverage ?? backfill?.coverage ?? null;
 	const last = backfill?.finishedAt ? fmtTime(backfill.finishedAt) : d.never;
+	const importing = Boolean(meta.importing ?? backfill?.truncated);
+	// 覆盖率必须看得见：不能让人拿「看着已导完」的数字做判断
+	const coverageText =
+		coverage && coverage.eligible > 0
+			? `${esc(d.fileCoverage)} ${esc(fmtInt(coverage.imported))}/${esc(fmtInt(coverage.eligible))} ${esc(d.sessionFiles)}${importing ? ` <span class="cps-c-amber">${esc(d.importing)}</span>` : ""}`
+			: "";
 	const parts = [
 		`${esc(d.ledger)} ${esc(fmtInt(ledger.records ?? 0))} ${esc(d.rows)}`,
 		`${esc(d.sessionsRoot)} <code>${esc(meta.sessionsRoot ?? "--")}</code>`,
 		`${esc(d.lastBackfill)} ${esc(last)}${backfill ? ` · ${esc(fmtInt(backfill.files ?? 0))} ${esc(d.files)}` : ""}`,
 	];
+	if (coverageText) parts.unshift(coverageText);
 	if (meta.mode === "live-only") parts.push(`<span class="cps-c-amber">${esc(d.liveOnly)}</span>`);
-	return `<div class="cps-meta">${parts.join(" · ")}</div>`;
+	const stopBtn = importing ? `<button class="cps-btn" data-act="stopImport">${esc(d.stopImport)}</button>` : "";
+	return `<div class="cps-meta">${parts.join(" · ")}${stopBtn ? ` ${stopBtn}` : ""}</div>`;
 }
 
 /** 整页渲染。 */
@@ -949,6 +966,10 @@ function onRootClick(event) {
 		}
 		if (act === "backfill") {
 			void postAction("/api/backfill");
+			return;
+		}
+		if (act === "stopImport") {
+			void postAction("/api/backfill/stop");
 			return;
 		}
 		if (act === "grant") {
