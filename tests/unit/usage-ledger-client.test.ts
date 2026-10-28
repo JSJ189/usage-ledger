@@ -1,168 +1,248 @@
 // @vitest-environment jsdom
 /**
- * usage-ledger 客户端看板单测（jsdom）：挂载 → 渲染 → 筛选 → 清理。
+ * 客户端看板单测（jsdom）：挂载 → 渲染 → 筛选 / 分页 / 动作 → 清理。
  *
  * 这里不校验像素，只锁住「真实渲染路径不炸」与几个硬约束：
- *  - 指标卡 / 双图 SVG / 模型表 / 事件表都真的被渲染出来；
- *  - 事件行可点开 token 拆分；
- *  - 窗口与客户端筛选真的换了查询参数；
- *  - 降级（账本缺失）时给明确空态文案，不抛错；
- *  - cleanup 后容器清空、样式与监听不留残骸（除宿主共享的 style 之外不碰 document 其它节点）。
+ *  - 指标卡 / 双图 SVG / 按模型表 / 记录表都真的渲染出来，数字格式对；
+ *  - 点模型行 = 只看该模型，点记录行 = 展开 token 拆分；
+ *  - 窗口 / 粒度 / 状态 / 分页都真的换了查询参数；
+ *  - live-only 降级给「授权并导入历史」按钮，点了会 POST /api/grant；
+ *  - 空账本与接口失败都给明确文案、不抛错；
+ *  - cleanup 后容器清空、样式与监听不留残骸。
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 interface FetchCall {
 	url: string;
+	method: string;
 }
 
 const state = {
 	calls: [] as FetchCall[],
-	failMode: "ok" as "ok" | "no-db" | "network",
+	failMode: "ok" as "ok" | "empty" | "network" | "live-only",
 };
 
-function payloadFor(url: string) {
-	if (state.failMode === "network") return null;
-	if (state.failMode === "no-db") {
-		// 与服务端 discoverLedger 的空态同形状：code + candidates + hint
-		return {
-			ok: false,
-			code: "db-not-found",
-			reason: "未找到代理用量账本 usage.db（已试 3 个位置）",
-			reasonEn: "No proxy usage ledger found (tried 3 locations)",
-			hint: "在设置里填 usage.db 绝对路径",
-			hintEn: "Set the absolute path to usage.db in settings",
-			candidates: [
-				"C:\\Users\\me\\.pi\\agent\\cliproxyapi.json",
-				"C:\\Users\\me\\AppData\\Local\\CLIProxyAPI",
-				"C:\\Users\\me\\.local\\share\\cliproxyapi",
-			],
-			meta: { dbPath: "", window: "today", client: "all", generatedAt: Date.now(), cached: false },
-		};
-	}
-	if (url.includes("/api/summary")) {
-		return {
-			ok: true,
-			meta: {
-				dbPath: "E:\\EasyCLIProxyAPI-v0.2.25-Windows-amd64\\usage-records\\usage.db",
-				window: "today",
-				client: "all",
-				groupBy: "model",
-				generatedAt: Date.now(),
-				cached: false,
-				price: {
-					available: true,
-					stale: false,
-					fetchedAt: Date.now() - 3600_000,
-					sourceLabels: ["models.dev", "LiteLLM"],
-					failedSources: [],
-					entryCount: 6,
-					lastError: null,
-					refreshFailedAt: null,
-					overridesError: null,
-				},
-			},
-			groupBy: "model",
-			summary: {
-				calls: 1234,
-				failed: 21,
-				canceled: 3,
-				bad: 21,
-				success: 1213,
-				successRate: 1213 / 1234,
-				latencyAvg: 13_500,
-				latencyMax: 40_000,
-				tokPerSec: 42.5,
-				tokPerSecSamples: 1200,
-				tokens: {
-					input: 1_500_000,
-					output: 90_000,
-					reasoning: 12_000,
-					cacheRead: 900_000,
-					cacheCreation: 0,
-					total: 2_502_000,
-				},
-				ttft: { samples: 1201, p50: 6333, p90: 14918, p99: 34_519, avg: 7_900 },
-				cost: {
-					amount: 12.3456,
-					pricedCalls: 1200,
-					unknownCalls: 34,
-					totalCalls: 1234,
-					unknownRatio: 34 / 1234,
-					unknownRate: 34 / 1234,
-				},
-			},
-			groups: [
-				{
-					key: "gemini-3.8-flash-high",
-					model: "gemini-3.8-flash-high",
-					calls: 900,
-					failed: 10,
-					canceled: 1,
-					bad: 10,
-					success: 890,
-					successRate: 890 / 900,
-					latencyAvg: 12_000,
-					latencyMax: 30_000,
-					tokPerSec: 1014.9,
-					tokPerSecSamples: 890,
-					tokens: { input: 1e6, output: 5e4, reasoning: 0, cacheRead: 8e5, cacheCreation: 0, total: 1850000 },
-					failRate: 10 / 900,
-					ttftP50: 6498,
-					ttftP90: 9000,
-					ttftSamples: 880,
-					cost: {
-						amount: 10.5,
-						pricedCalls: 890,
-						unknownCalls: 10,
-						totalCalls: 900,
-						unknownRatio: 10 / 900,
-						unknownRate: 10 / 900,
-					},
-				},
-			],
-		};
-	}
-	if (url.includes("/api/series")) {
-		return {
-			ok: true,
-			meta: { dbPath: "x", window: "today", client: "all", generatedAt: Date.now(), cached: false },
-			hours: [
-				{ hour: "2026-10-27T01:00:00", calls: 10, bad: 1, ttftP50: 400, ttftP90: 900, ttftSamples: 9 },
-				{ hour: "2026-10-27T02:00:00", calls: 20, bad: 0, ttftP50: 600, ttftP90: 1200, ttftSamples: 20 },
-			],
-		};
-	}
+const RECORD_TS = new Date(2026, 9, 27, 1, 2, 3).getTime();
+
+function summaryPayload() {
 	return {
 		ok: true,
-		meta: { dbPath: "x", window: "today", client: "all", generatedAt: Date.now(), cached: false },
-		events: [
+		meta: { window: "today", mode: "full", cached: false },
+		summary: {
+			calls: 1234,
+			ok: 1213,
+			failed: 18,
+			incomplete: 3,
+			successRate: 1213 / 1234,
+			ttft: { samples: 800, p50: 6333, p90: 14_918, p99: 34_519, avg: 7900, coverage: 800 / 1234 },
+			latencyAvg: 13_500,
+			latencyMax: 40_000,
+			latencySamples: 1200,
+			tokPerSec: 42.5,
+			tokPerSecSamples: 1200,
+			tokens: {
+				input: 1_500_000,
+				output: 90_000,
+				cacheRead: 900_000,
+				cacheWrite: 0,
+				reasoning: 12_000,
+				total: 2_502_000,
+			},
+			cost: { amount: 12.3456, pricedCalls: 1200, unpricedCalls: 34, totalCalls: 1234 },
+			models: 3,
+			providers: 2,
+		},
+		models: [
 			{
-				id: 42,
-				timestamp: "2026-10-27T01:02:03+08:00",
-				timestampMs: 1,
 				model: "gemini-3.8-flash-high",
-				provider: "antigravity",
-				client: "pi",
-				failed: false,
-				canceled: false,
-				latencyMs: 12_000,
-				ttftMs: 4000,
-				inputTokens: 1000,
-				outputTokens: 500,
-				reasoningTokens: 20,
-				cacheReadTokens: 800,
-				totalTokens: 1500,
-				costAmount: 0.0123,
+				calls: 900,
+				ok: 890,
+				failed: 8,
+				incomplete: 2,
+				successRate: 890 / 900,
+				ttft: { samples: 600, p50: 6498, p90: 9000, p99: 12_000 },
+				latencyAvg: 12_000,
+				tokPerSec: 1014.9,
+				tokens: { input: 1e6, output: 5e4, cacheRead: 8e5, cacheWrite: 0, reasoning: 0, total: 1_850_000 },
+				cost: { amount: 10.5, pricedCalls: 890, unpricedCalls: 10, totalCalls: 900 },
+				callShare: 900 / 1234,
+				costShare: 10.5 / 12.3456,
+				providers: ["antigravity"],
+			},
+			{
+				model: "grok-4.7",
+				calls: 334,
+				ok: 323,
+				failed: 8,
+				incomplete: 3,
+				successRate: 0.967,
+				ttft: { samples: 200, p50: 1200, p90: 2000, p99: 3000 },
+				latencyAvg: 4000,
+				tokPerSec: 120,
+				tokens: { input: 500_000, output: 40_000, cacheRead: 100_000, cacheWrite: 0, reasoning: 1000, total: 640_000 },
+				cost: { amount: 1.8456, pricedCalls: 310, unpricedCalls: 24, totalCalls: 334 },
+				callShare: 334 / 1234,
+				costShare: 0.15,
+				providers: ["cliproxyapi"],
 			},
 		],
 	};
+}
+
+function seriesPayload() {
+	return {
+		ok: true,
+		meta: { window: "today", bucket: "hour" },
+		series: [
+			{ hour: "2026-10-27T01:00:00", calls: 10, bad: 1, ttftP50: 400, ttftP90: 900, ttftSamples: 9 },
+			{ hour: "2026-10-27T02:00:00", calls: 20, bad: 0, ttftP50: 600, ttftP90: 1200, ttftSamples: 20 },
+		],
+	};
+}
+
+function recordsPayload() {
+	return {
+		ok: true,
+		meta: { window: "today" },
+		records: [
+			{
+				id: "r42",
+				ts: RECORD_TS,
+				model: "gemini-3.8-flash-high",
+				provider: "antigravity",
+				thinkingLevel: "high",
+				conversationId: "conv-1",
+				projectDir: "--proj--",
+				inputTokens: 1000,
+				outputTokens: 500,
+				cacheReadTokens: 800,
+				cacheWriteTokens: 0,
+				reasoningTokens: 20,
+				totalTokens: 1500,
+				costUsd: 0.0123,
+				durationMs: 12_000,
+				ttftMs: 4000,
+				stopReason: "stop",
+				status: "ok",
+				source: "live",
+				sources: ["live", "backfill"],
+			},
+			{
+				id: "r43",
+				ts: RECORD_TS - 60_000,
+				model: "grok-4.7",
+				provider: "cliproxyapi",
+				thinkingLevel: null,
+				inputTokens: 10,
+				outputTokens: 0,
+				cacheReadTokens: 0,
+				cacheWriteTokens: 0,
+				reasoningTokens: 0,
+				totalTokens: 10,
+				costUsd: null,
+				durationMs: null,
+				ttftMs: null,
+				stopReason: "error",
+				status: "error",
+				source: "backfill",
+				sources: ["backfill"],
+			},
+		],
+		page: 1,
+		pages: 3,
+		pageSize: 20,
+		total: 45,
+	};
+}
+
+function metaPayload() {
+	const liveOnly = state.failMode === "live-only";
+	return {
+		ok: true,
+		meta: {
+			window: "all",
+			ledgerPath: "C:\\Users\\me\\.pi-web-ui\\plugin-data\\usage-ledger\\ledger.jsonl",
+			ledger: { records: 45, bad: 0, writeErrors: 0, persistence: true },
+			sessionsRoot: "C:\\Users\\me\\.pi\\agent\\sessions",
+			fsReady: !liveOnly,
+			mode: liveOnly ? "live-only" : "full",
+			backfill: { files: 12, records: 45, finishedAt: RECORD_TS, errors: [] },
+			backfillError: null,
+			grant: liveOnly
+				? {
+						required: true,
+						reason: "会话目录未授权",
+						reasonEn: "Sessions directory not authorized",
+						hint: "在看板点「授权并导入历史」",
+						hintEn: "Click authorize in the dashboard",
+					}
+				: { required: false, reason: "", reasonEn: "", hint: "", hintEn: "" },
+		},
+	};
+}
+
+function payloadFor(url: string) {
+	if (state.failMode === "network") return null;
+	if (state.failMode === "empty") {
+		if (url.includes("/api/summary")) {
+			return {
+				ok: true,
+				meta: {
+					window: "today",
+					ledger: { records: 0 },
+					backfill: null,
+					mode: "full",
+					grant: { required: false },
+					sessionsRoot: "/tmp/sessions",
+				},
+				summary: {
+					calls: 0,
+					ok: 0,
+					failed: 0,
+					incomplete: 0,
+					successRate: null,
+					ttft: { samples: 0, p50: null, p90: null, p99: null, avg: null, coverage: null },
+					latencyAvg: null,
+					latencyMax: null,
+					latencySamples: 0,
+					tokPerSec: null,
+					tokPerSecSamples: 0,
+					tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 },
+					cost: { amount: null, pricedCalls: 0, unpricedCalls: 0, totalCalls: 0 },
+					models: 0,
+					providers: 0,
+				},
+				models: [],
+			};
+		}
+		if (url.includes("/api/series")) return { ok: true, meta: {}, series: [] };
+		if (url.includes("/api/records")) {
+			return { ok: true, meta: {}, records: [], page: 1, pages: 1, pageSize: 20, total: 0 };
+		}
+		return metaPayload();
+	}
+	if (url.includes("/api/summary")) return summaryPayload();
+	if (url.includes("/api/series")) return seriesPayload();
+	if (url.includes("/api/records")) return recordsPayload();
+	return metaPayload();
+}
+
+function stubFetch() {
+	const mock = vi.fn(async (url: string, init?: RequestInit) => {
+		state.calls.push({ url: String(url), method: String(init?.method ?? "GET") });
+		const body = payloadFor(String(url));
+		if (body === null) throw new Error("boom");
+		return { ok: true, status: 200, json: async () => body };
+	});
+	vi.stubGlobal("fetch", mock);
+	return mock;
 }
 
 // 语言跟随 documentElement.lang（宿主切语言也走这条路）：固定中文以便断言文案
 document.documentElement.lang = "zh-CN";
 
 const clientEntry = await import("../../client/entry.mjs");
-const { callsChart, ttftChart, dict, fmtCost, fmtMs, costShare, multiMark } = clientEntry;
+const { callsChart, ttftChart, dict, fmtCost, fmtMs, fmtShare, renderCards } = clientEntry;
 
 function mountDashboard() {
 	const container = document.createElement("div");
@@ -181,45 +261,36 @@ afterEach(() => {
 });
 
 describe("客户端看板渲染", () => {
-	it("渲染指标卡 / 双图 / 模型表 / 事件表", async () => {
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async (url: string) => {
-				state.calls.push({ url: String(url) });
-				const body = payloadFor(String(url));
-				return { ok: true, status: 200, json: async () => body };
-			}),
-		);
+	it("渲染指标卡 / 双图 / 按模型表 / 记录表，并打全 4 个接口", async () => {
+		stubFetch();
 		const { container, cleanup } = mountDashboard();
-		await vi.waitFor(() => {
-			expect(container.querySelector(".cps-cards")).toBeTruthy();
-		});
+		await vi.waitFor(() => expect(container.querySelector(".cps-cards")).toBeTruthy());
 		const html = container.innerHTML;
-		// 指标卡：请求数 1.2k、TTFT p50 4.37s、平均 tok/s
+		// 指标卡：调用 1.2k / 成功率 98.3% / TTFT p50 6.33s
 		expect(html).toContain("1.2k");
-		expect(html).toContain("6.33s");
-		expect(html).toContain("43"); // 平均 tok·s⁻¹ 42.5 → 大数值保留整数
 		expect(html).toContain("98.3%");
+		expect(html).toContain("6.33s");
+		expect(html).toContain("14.9s"); // p90
+		expect(html).toContain("$12.35"); // 真实成本
+		expect(html).toContain("SDK usage.cost.total");
 		// 两张手写 SVG 图
 		expect(container.querySelectorAll("svg.cps-svg").length).toBe(2);
-		expect(container.querySelectorAll("svg.cps-svg rect").length).toBeGreaterThan(0); // 柱状
-		expect(container.querySelectorAll("svg.cps-svg polyline").length).toBeGreaterThan(0); // 折线
-		// 成本卡 + 价格快照行（来源 / 估算 / 未知价占比）
-		expect(html).toContain("≈$12.35");
-		expect(html).toContain("价格快照");
-		expect(html).toContain("models.dev");
-		expect(html).toContain("未知价 34 次");
-		// 维度汇总表与事件表
+		expect(container.querySelectorAll("svg.cps-svg rect").length).toBeGreaterThan(0);
+		expect(container.querySelectorAll("svg.cps-svg polyline").length).toBeGreaterThan(0);
+		// 按模型表 + 记录表
+		expect(container.querySelectorAll("tr[data-model]").length).toBe(2);
+		expect(container.querySelectorAll("tr[data-rid]").length).toBe(2);
 		expect(html).toContain("gemini-3.8-flash-high");
-		expect(html).toContain("≈$10.50");
-		expect(html).toContain("≈$0.0123");
-		expect(html).toContain("01:02:03");
+		expect(html).toContain("$10.50");
+		expect(html).toContain("$0.0123");
+		expect(html).toContain("10-27 01:02:03");
 		expect(html).toContain("成功");
-		expect(html).toContain("请求数");
-		expect(html).toContain("E:\\EasyCLIProxyAPI");
-		// 三路接口都打了
+		// 状态行：账本条数 / 会话目录 / 上次回填
+		expect(html).toContain("账本");
+		expect(html).toContain("C:\\Users\\me\\.pi\\agent\\sessions");
 		expect(state.calls.map((c) => c.url.split("?")[0]).sort()).toEqual([
-			"/plugins-api/usage-ledger/api/events",
+			"/plugins-api/usage-ledger/api/meta",
+			"/plugins-api/usage-ledger/api/records",
 			"/plugins-api/usage-ledger/api/series",
 			"/plugins-api/usage-ledger/api/summary",
 		]);
@@ -228,86 +299,141 @@ describe("客户端看板渲染", () => {
 		container.remove();
 	});
 
-	it("点击事件行展开 token 拆分，再点收起", async () => {
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async (url: string) => ({ ok: true, status: 200, json: async () => payloadFor(String(url)) })),
-		);
+	it("TTFT 覆盖率与「只能实时采集」说明必须可见（不许把样本少说成很快）", async () => {
+		stubFetch();
 		const { container, cleanup } = mountDashboard();
-		await vi.waitFor(() => expect(container.querySelector("tr[data-rid='42']")).toBeTruthy());
-		const row = container.querySelector("tr[data-rid='42']") as HTMLElement;
-		row.click();
+		await vi.waitFor(() => expect(container.querySelector(".cps-cards")).toBeTruthy());
+		const html = container.innerHTML;
+		expect(html).toContain("TTFT 覆盖");
+		expect(html).toContain("64.8%"); // 800/1234
+		expect(html).toContain("TTFT 只能实时采集");
+		cleanup();
+		container.remove();
+	});
+
+	it("缺 TTFT / 缺成本的记录显示 --，不伪装成 0 或 $0", async () => {
+		stubFetch();
+		const { container, cleanup } = mountDashboard();
+		await vi.waitFor(() => expect(container.querySelector("tr[data-rid='r43']")).toBeTruthy());
+		const row43 = container.querySelector("tr[data-rid='r43']") as HTMLElement;
+		const cells = [...row43.querySelectorAll("td")].map((td) => td.textContent ?? "");
+		expect(cells).toContain("--"); // 首字 / 耗时 / 成本
+		expect(cells.join(" ")).not.toContain("$0.0000");
+		cleanup();
+		container.remove();
+	});
+
+	it("点击记录行展开 token 拆分与来源，再点收起", async () => {
+		stubFetch();
+		const { container, cleanup } = mountDashboard();
+		await vi.waitFor(() => expect(container.querySelector("tr[data-rid='r42']")).toBeTruthy());
+		(container.querySelector("tr[data-rid='r42']") as HTMLElement).click();
 		await vi.waitFor(() => expect(container.querySelector(".cps-detail")).toBeTruthy());
-		expect(container.querySelector(".cps-detail")?.textContent).toContain("1.5k");
-		(container.querySelector("tr[data-rid='42']") as HTMLElement).click();
+		const detail = container.querySelector(".cps-detail")?.textContent ?? "";
+		expect(detail).toContain("1.5k");
+		expect(detail).toContain("实时+回填");
+		expect(detail).toContain("r42");
+		(container.querySelector("tr[data-rid='r42']") as HTMLElement).click();
 		await vi.waitFor(() => expect(container.querySelector(".cps-detail")).toBeNull());
 		cleanup();
 		container.remove();
 	});
 
-	it("窗口与客户端筛选真的换了查询参数", async () => {
-		const fetchMock = vi.fn(async (url: string) => ({
-			ok: true,
-			status: 200,
-			json: async () => payloadFor(String(url)),
-		}));
-		vi.stubGlobal("fetch", fetchMock);
+	it("点模型行 → 只看该模型（查询带 model=）并出现清除 chip", async () => {
+		const mock = stubFetch();
 		const { container, cleanup } = mountDashboard();
-		await vi.waitFor(() => expect(container.querySelector(".cps-cards")).toBeTruthy());
-		fetchMock.mockClear();
-
-		const btn7d = container.querySelector('[data-act="window"][data-value="7d"]') as HTMLElement;
-		btn7d.click();
-		await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
-		expect(String(fetchMock.mock.calls[0][0])).toContain("window=7d");
-
-		fetchMock.mockClear();
-		const btnPi = container.querySelector('[data-act="client"][data-value="pi"]') as HTMLElement;
-		btnPi.click();
-		await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
-		expect(String(fetchMock.mock.calls[0][0])).toContain("client=pi");
-
-		fetchMock.mockClear();
-		const btnRoute = container.querySelector('[data-act="groupBy"][data-value="provider"]') as HTMLElement;
-		btnRoute.click();
-		await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
-		expect(String(fetchMock.mock.calls[0][0])).toContain("groupBy=provider");
-
-		fetchMock.mockClear();
-		const btnPrices = container.querySelector('[data-act="prices"]') as HTMLElement;
-		btnPrices.click();
-		await vi.waitFor(() =>
-			expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/api/prices/refresh"))).toBe(true),
-		);
+		await vi.waitFor(() => expect(container.querySelector("tr[data-model]")).toBeTruthy());
+		mock.mockClear();
+		(container.querySelector("tr[data-model='grok-4.7']") as HTMLElement).click();
+		await vi.waitFor(() => expect(mock).toHaveBeenCalled());
+		expect(String(mock.mock.calls[0][0])).toContain("model=grok-4.7");
+		await vi.waitFor(() => expect(container.querySelector(".cps-chip")).toBeTruthy());
+		expect(container.querySelector(".cps-chip")?.textContent).toContain("只看 grok-4.7");
+		mock.mockClear();
+		(container.querySelector(".cps-chip") as HTMLElement).click();
+		await vi.waitFor(() => expect(mock).toHaveBeenCalled());
+		expect(String(mock.mock.calls[0][0])).toContain("model=&");
 		cleanup();
 		container.remove();
 	});
 
-	it("账本缺失：显示明确空态与重试按钮，且不抛错", async () => {
-		state.failMode = "no-db";
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async (url: string) => ({ ok: true, status: 200, json: async () => payloadFor(String(url)) })),
-		);
+	it("窗口 / 粒度 / 状态 / 分页都真的换了查询参数", async () => {
+		const mock = stubFetch();
+		const { container, cleanup } = mountDashboard();
+		await vi.waitFor(() => expect(container.querySelector(".cps-cards")).toBeTruthy());
+
+		mock.mockClear();
+		(container.querySelector('[data-act="window"][data-value="7d"]') as HTMLElement).click();
+		await vi.waitFor(() => expect(mock).toHaveBeenCalled());
+		expect(String(mock.mock.calls[0][0])).toContain("window=7d");
+
+		mock.mockClear();
+		(container.querySelector('[data-act="bucket"][data-value="day"]') as HTMLElement).click();
+		await vi.waitFor(() => expect(mock).toHaveBeenCalled());
+		expect(String(mock.mock.calls[0][0])).toContain("bucket=day");
+
+		mock.mockClear();
+		(container.querySelector('[data-act="status"][data-value="error"]') as HTMLElement).click();
+		await vi.waitFor(() => expect(mock).toHaveBeenCalled());
+		expect(mock.mock.calls.some((c) => String(c[0]).includes("status=error"))).toBe(true);
+
+		mock.mockClear();
+		(container.querySelector('[data-act="page"][data-value="2"]') as HTMLElement).click();
+		await vi.waitFor(() => expect(mock).toHaveBeenCalled());
+		expect(mock.mock.calls.some((c) => String(c[0]).includes("page=2"))).toBe(true);
+		cleanup();
+		container.remove();
+	});
+
+	it("回填按钮走 POST /api/backfill", async () => {
+		const mock = stubFetch();
+		const { container, cleanup } = mountDashboard();
+		await vi.waitFor(() => expect(container.querySelector(".cps-cards")).toBeTruthy());
+		mock.mockClear();
+		const backfillBtn = container.querySelector('[data-act="backfill"]') as HTMLButtonElement;
+		expect(backfillBtn).toBeTruthy();
+		await vi.waitFor(() => expect(backfillBtn.disabled).toBe(false));
+		backfillBtn.click();
+		await vi.waitFor(() => expect(mock).toHaveBeenCalled());
+		const post = mock.mock.calls.find((c) => (c[1] as RequestInit)?.method === "POST");
+		expect(String(post?.[0])).toContain("/api/backfill");
+		cleanup();
+		container.remove();
+	});
+
+	it("空账本：给明确空态（跑一次对话或授权导入历史），不画卡片", async () => {
+		state.failMode = "empty";
+		stubFetch();
+		const { container, cleanup } = mountDashboard();
+		await vi.waitFor(() => expect(container.textContent).toContain("还没有记录"));
+		expect(container.textContent).toContain("跑一次对话");
+		expect(container.textContent).toContain("导入历史");
+		expect(container.querySelector(".cps-empty")).toBeTruthy();
+		cleanup();
+		container.remove();
+	});
+
+	it("live-only 降级：显示原因与授权按钮，点了 POST /api/grant", async () => {
+		state.failMode = "live-only";
+		const mock = stubFetch();
 		const { container, cleanup } = mountDashboard();
 		await vi.waitFor(() => expect(container.querySelector(".cps-notice")).toBeTruthy());
 		const notice = container.querySelector(".cps-notice") as HTMLElement;
-		expect(notice.textContent).toContain("未找到账本");
-		expect(notice.textContent).toContain("usage.db");
-		expect(notice.querySelector("[data-act='refresh']")).toBeTruthy();
-		// 结构化空态：已尝试的候选路径要展示出来（否则用户不知道该填什么）
-		const tried = notice.querySelector(".cps-tried") as HTMLElement | null;
-		expect(tried, "空态必须展示已尝试的候选位置").toBeTruthy();
-		const triedText = tried?.textContent ?? "";
-		expect(triedText).toContain("CLIProxyAPI");
-		expect(triedText).toContain("cliproxyapi.json");
-		// 空态下不应有指标卡
-		expect(container.querySelector(".cps-cards")).toBeNull();
+		expect(notice.textContent).toContain("会话目录未授权");
+		expect(notice.textContent).toContain("在看板点");
+		const grantBtn = container.querySelector('[data-act="grant"]') as HTMLElement;
+		expect(grantBtn).toBeTruthy();
+		mock.mockClear();
+		grantBtn.click();
+		await vi.waitFor(() => expect(mock).toHaveBeenCalled());
+		const post = mock.mock.calls.find((c) => (c[1] as RequestInit)?.method === "POST");
+		expect(String(post?.[0])).toContain("/api/grant");
 		cleanup();
 		container.remove();
 	});
 
-	it("接口网络失败：也走空态文案，不抛异常", async () => {
+	it("接口网络失败：给空态文案并带上错误原因，不抛异常", async () => {
+		state.failMode = "network";
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async () => {
@@ -315,15 +441,30 @@ describe("客户端看板渲染", () => {
 			}),
 		);
 		const { container, cleanup } = mountDashboard();
-		await vi.waitFor(() =>
-			expect((container.querySelector(".cps-notice") as HTMLElement | null)?.textContent ?? "").toContain("boom"),
-		);
+		await vi.waitFor(() => expect(container.textContent).toContain("boom"));
+		expect(container.querySelector(".cps-notice")).toBeTruthy();
+		expect(container.querySelector('[data-act="refresh"]')).toBeTruthy();
+		cleanup();
+		container.remove();
+	});
+
+	it("重试按钮重新拉数据", async () => {
+		state.failMode = "network";
+		const mock = vi.fn(async () => {
+			throw new Error("boom");
+		});
+		vi.stubGlobal("fetch", mock);
+		const { container, cleanup } = mountDashboard();
+		await vi.waitFor(() => expect(container.querySelector(".cps-notice")).toBeTruthy());
+		mock.mockClear();
+		(container.querySelector('[data-act="refresh"]') as HTMLElement).click();
+		await vi.waitFor(() => expect(mock).toHaveBeenCalled());
 		cleanup();
 		container.remove();
 	});
 });
 
-describe("图表纯函数（0 点 / 单点 / 极值不出 NaN）", () => {
+describe("纯函数：图表与格式化", () => {
 	it("空数据给空态文案，不造 SVG", () => {
 		expect(callsChart([], dict("zh"))).not.toContain("<svg");
 		expect(ttftChart([], dict("zh"))).not.toContain("<svg");
@@ -336,124 +477,82 @@ describe("图表纯函数（0 点 / 单点 / 极值不出 NaN）", () => {
 			expect(svg).not.toMatch(/NaN|Infinity|undefined/);
 		}
 		const extreme = [
-			{ hour: "2026-10-27T00:00:00", calls: 219944, bad: 219944, ttftP50: 0, ttftP90: 0, ttftSamples: 0 },
-			{ hour: "2026-10-27T01:00:00", calls: 0, bad: 0, ttftP50: 219944, ttftP90: 219944, ttftSamples: 1 },
+			{ hour: "2026-10-27T00:00:00", calls: 219_944, bad: 219_944, ttftP50: 0, ttftP90: 0, ttftSamples: 0 },
+			{ hour: "2026-10-27T01:00:00", calls: 0, bad: 0, ttftP50: 219_944, ttftP90: 219_944, ttftSamples: 1 },
 		];
 		for (const svg of [callsChart(extreme, dict("zh")), ttftChart(extreme, dict("zh"))]) {
 			expect(svg).not.toMatch(/NaN|Infinity|undefined/);
 		}
-		// 全 0 的 ttft 列 → 空态（没有可用样本）
 		const zeroTtft = [{ hour: "2026-10-27T02:00:00", calls: 3, bad: 0, ttftP50: 0, ttftP90: 0, ttftSamples: 0 }];
 		expect(ttftChart(zeroTtft, dict("zh"))).not.toContain("<svg");
 	});
 
-	it("金额与毫秒格式化：未知价是 --，不是 0", () => {
-		expect(fmtCost(null, dict("zh"))).toBe("--");
-		expect(fmtCost(0, dict("zh"))).toBe("≈$0.0000");
-		expect(fmtCost(12.3456, dict("zh"))).toBe("≈$12.35");
+	it("按天桶的 x 轴标签是日期（不带时分）", () => {
+		const svg = callsChart([{ hour: "2026-10-27", calls: 3, bad: 0 }], dict("zh"));
+		expect(svg).toContain("10-27");
+		expect(svg).not.toContain("2026-10-27T");
+	});
+
+	it("金额与毫秒格式化：缺失是 --，0 是 0", () => {
+		expect(fmtCost(null)).toBe("--");
+		expect(fmtCost(undefined)).toBe("--");
+		expect(fmtCost(0)).toBe("$0.0000");
+		expect(fmtCost(0.0123)).toBe("$0.0123");
+		expect(fmtCost(12.3456)).toBe("$12.35");
 		expect(fmtMs(0)).toBe("--");
 		expect(fmtMs(null)).toBe("--");
-	});
-});
-
-describe("R5：未知价占比必须显示且不得伪装成 0", () => {
-	it("卡片显示「未知价 N 次（占 X%）」，悬停写明已排除", async () => {
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async (url: string) => ({ ok: true, status: 200, json: async () => payloadFor(String(url)) })),
-		);
-		const { container, cleanup } = mountDashboard();
-		await vi.waitFor(() => expect(container.querySelector(".cps-cards")).toBeTruthy());
-		const html = container.innerHTML;
-		expect(html).toContain("未知价 34 次（2.8%）");
-		expect(html).toContain("已排除未知价请求 34 次（2.8%）");
-		// 金额仍带 ≈ 前缀
-		expect(html).toContain("≈$12.35");
-		cleanup();
-		container.remove();
+		expect(fmtMs(733)).toBe("733ms");
+		expect(fmtMs(6333)).toBe("6.33s");
 	});
 
-	it("costShare：0 请求是 --、全未知是 100%、旧载荷也能读", () => {
-		expect(costShare({ amount: null, pricedCalls: 0, unknownCalls: 0, totalCalls: 0, unknownRatio: null })).toBe("--");
-		expect(costShare({ amount: null, pricedCalls: 0, unknownCalls: 5, totalCalls: 5, unknownRatio: 1 })).toBe("100.0%");
-		// 只有旧字段（R2 载荷）：自算
-		expect(costShare({ amount: 1, pricedCalls: 3, unknownCalls: 1 })).toBe("25.0%");
-		// 旧名 unknownRate
-		expect(costShare({ amount: 1, pricedCalls: 1, unknownCalls: 1, unknownRate: 0.5 })).toBe("50.0%");
-		expect(costShare(null)).toBe("--");
+	it("占比格式化：缺失是 --、0 是 0.0%", () => {
+		expect(fmtShare(null)).toBe("--");
+		expect(fmtShare(0)).toBe("0.0%");
+		expect(fmtShare(0.004)).toBe("0.40%");
+		expect(fmtShare(0.5)).toBe("50.0%");
 	});
 
-	it("全未知价的汇总：金额是 --（不是 ≈$0）", async () => {
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async (url: string) => {
-				const body = payloadFor(String(url)) as Record<string, unknown>;
-				if (String(url).includes("/api/summary")) {
-					(body.summary as Record<string, unknown>).calls = 5;
-					(body.summary as Record<string, unknown>).cost = {
-						amount: null,
-						pricedCalls: 0,
-						unknownCalls: 5,
-						totalCalls: 5,
-						unknownRatio: 1,
-						unknownRate: 1,
-					};
-				}
-				return { ok: true, status: 200, json: async () => body };
-			}),
-		);
-		const { container, cleanup } = mountDashboard();
-		// 模块级 runtime.state 跨挂载保留（真实宿主只有一个容器），这里等新数据到位
-		await vi.waitFor(() => expect(container.innerHTML).toContain("未知价 5 次"));
-		const html = container.innerHTML;
-		expect(html).not.toContain("≈$0.0000");
-		cleanup();
-		container.remove();
+	it("renderCards：没有 summary 时不渲染（不造空卡）", () => {
+		expect(renderCards(null, dict("zh"))).toBe("");
 	});
-});
 
-describe("R7：跨源价格分歧必须在金额旁可见", () => {
-	it("multiMark：无次数不画、有次数给标签 + 悬停写明次数", () => {
+	it("renderCards：全 0 / 全 null 的账本给 -- 而不是 0% 或 $0", () => {
 		const d = dict("zh");
-		expect(multiMark(null, d)).toBe("");
-		expect(multiMark({ multiSourceCalls: 0 }, d)).toBe("");
-		const html = multiMark({ multiSourceCalls: 12, multiSourceRatio: 0.5 }, d);
-		expect(html).toContain("多源不一致");
-		expect(html).toContain("跨源价格分歧：12 次请求");
-		// 英文
-		expect(multiMark({ multiSourceCalls: 3 }, dict("en"))).toContain("multi-source");
+		const html = renderCards(
+			{
+				calls: 0,
+				ok: 0,
+				failed: 0,
+				incomplete: 0,
+				successRate: null,
+				ttft: { samples: 0, p50: null, p90: null, p99: null, coverage: null },
+				latencyAvg: null,
+				tokPerSec: null,
+				tokPerSecSamples: 0,
+				tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 },
+				cost: { amount: null, pricedCalls: 0, unpricedCalls: 0 },
+				models: 0,
+			},
+			d,
+		);
+		expect(html).toContain("--");
+		expect(html).not.toContain("$0.0000");
+		expect(html).not.toContain("0.0%");
 	});
 
-	it("成本卡与分组表都挂标记（悬停写明「跨源价格分歧：N 次请求」）", async () => {
-		vi.stubGlobal(
-			"fetch",
-			vi.fn(async (url: string) => {
-				const body = payloadFor(String(url)) as Record<string, unknown>;
-				if (String(url).includes("/api/summary")) {
-					(body.summary as Record<string, Record<string, unknown>>).cost = {
-						amount: 12.3456,
-						pricedCalls: 1234,
-						unknownCalls: 0,
-						totalCalls: 1234,
-						unknownRatio: 0,
-						unknownRate: 0,
-						multiSourceCalls: 34,
-						multiSourceRatio: 34 / 1234,
-					};
-					const groups = (body as Record<string, Record<string, unknown>[]>).groups;
-					(groups[0].cost as Record<string, unknown>).multiSourceCalls = 30;
-					(groups[0].cost as Record<string, unknown>).multiSourceRatio = 30 / 900;
-				}
-				return { ok: true, status: 200, json: async () => body };
-			}),
-		);
-		const { container, cleanup } = mountDashboard();
-		await vi.waitFor(() => expect(container.innerHTML).toContain("多源不一致"));
-		const html = container.innerHTML;
-		expect(html).toContain("跨源价格分歧：34 次请求"); // 汇总卡悬停
-		expect(html).toContain("跨源价格分歧：30 次请求"); // 分组行悬停
-		expect(container.querySelectorAll(".cps-badge.multi").length).toBeGreaterThanOrEqual(2);
-		cleanup();
-		container.remove();
+	it("中英文字典的键必须一一对应（宿主切语言不会缺字）", () => {
+		const zh = dict("zh");
+		const en = dict("en");
+		expect(Object.keys(zh).sort()).toEqual(Object.keys(en).sort());
+	});
+
+	it("字典覆盖 2.0 的关键文案（数据源 / TTFT 说明 / 授权）", () => {
+		for (const lang of ["zh", "en"]) {
+			const d = dict(lang);
+			expect(d.subtitle).toContain("pi-web-ui");
+			expect(d.ttftNote).toMatch(/TTFT/);
+			expect(d.grant).toBeTruthy();
+			expect(d.empty).toBeTruthy();
+		}
 	});
 });

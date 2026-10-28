@@ -1,17 +1,20 @@
 /**
- * usage-ledger 客户端看板
+ * usage-ledger 2.0 客户端看板
  *
  * 职责：
  *  1. 底栏徽标（bottombar 槽位）点击 → 切到本插件视图（走宿主 setView，不碰宿主 DOM）；
- *  2. 视图内渲染看板：指标卡（请求/成功率/取消/TTFT p50·p90·p99/平均时延/平均 tok·s⁻¹/token 合计）、
- *     按小时双图（请求数 + TTFT p90）、按模型汇总表、最近事件明细（可点开看单条 token 拆分）；
- *  3. 窗口（今日/7 天/30 天）与客户端族（全部/仅 pi）筛选，全部参数经宿主路由白名单校验；
+ *  2. 视图内渲染看板：指标卡（调用次数/成功率/失败+未收全/TTFT p50·p90·p99/平均延迟/
+ *     平均 tok·s⁻¹/token 合计/真实成本）、按模型汇总表（点行 = 只看该模型）、
+ *     按小时或按天趋势双图、记录明细表（分页 + 状态筛选 + 点开去重明细）；
+ *  3. 数据源全是 pi-web-ui 自己：实时运行事件（TTFT）+ 会话 JSONL（token/真实成本/耗时）。
+ *     不读任何代理账本、不抓价目表、不估算成本。
  *  4. 图表手写 SVG，零外部 CDN、零新增依赖；样式全在插件自己的 <style> 里，前缀 cps-。
  *
- * 数字口径（与 README / 服务端一致）：
- *  - `TTFT` = 代理侧「收到请求 → 上游首包」，与 response-speed 插件的客户端 TTFT 不是一回事；
- *  - `tok/s` = output_tokens / ((latency - ttft)/1000)，只有 latency > ttft 且 output > 0 的行参与；
- *  - 失败率按 `failed ∪ canceled` 并集计一次。
+ * 数字口径（与 lib/metrics.mjs / README 一致）：
+ *  - `TTFT` = turn_start → 第一个流式包；**只能实时采集**，回填的历史条目没有 TTFT，
+ *    所以看板必须显示 TTFT 覆盖率，不能把「样本少」伪装成「很快」；
+ *  - `tok/s` = outputTokens / (durationMs/1000)，只有两者都 > 0 的调用参与均值；
+ *  - 失败 = `status: "error"`；`incomplete` = 事件没收到 message 或会话没有 usage。
  */
 // 独立仓库：不引 `@pi-web-ui/plugin-sdk/client`（浏览器里是裸 ESM，解析不到宿主别名），
 // 把用到的两个纯函数内联在这里，语义与 plugin-sdk/client-utils.mjs 完全一致。
@@ -33,170 +36,202 @@ const ACTION_OPEN = "usage-ledger:open";
 const VIEW_NAME = "plugin:usage-ledger";
 const STYLE_ID = "usage-ledger-styles";
 const REFRESH_MS = 60_000;
+const PAGE_SIZE = 20;
 
 // ──────────────────────────────────────────────────────────── 文案
 
 const ZH = {
 	title: "用量账本",
-	subtitle: "EasyCLIProxyAPI 用量账本（只读）",
-	win: { today: "今日", "7d": "7 天", "30d": "30 天" },
-	clientAll: "全部客户端",
-	clientPi: "仅 pi 家族",
+	subtitle: "pi-web-ui 自己的每次模型调用（TTFT 只实时采集）",
+	win: { today: "今日", "7d": "7 天", "30d": "30 天", all: "全部" },
+	bucket: { hour: "按小时", day: "按天" },
 	refresh: "刷新",
+	backfill: "回填",
 	loading: "加载中…",
-	calls: "总请求",
+	calls: "调用次数",
 	successRate: "成功率",
-	canceled: "取消 / 失败",
+	failedIncomplete: "失败 / 未收全",
 	ttftP50: "TTFT p50",
 	ttftP90: "TTFT p90",
 	ttftP99: "TTFT p99",
-	latencyAvg: "平均时延",
+	latencyAvg: "平均延迟",
 	tokPerSec: "平均 tok·s⁻¹",
-	tokensIn: "输入 token",
-	tokensOut: "输出 token",
-	cacheRead: "缓存读 token",
-	chartCalls: "按小时 · 请求数",
-	chartTtft: "按小时 · TTFT 分位",
-	modelTable: "按模型汇总",
-	eventTable: "最近事件",
+	tokensTotal: "token 合计",
+	cost: "真实成本",
+	costNote: "SDK usage.cost.total",
+	tokensIn: "输入",
+	tokensOut: "输出",
+	cacheRead: "缓存读",
+	cacheWrite: "缓存写",
+	reasoning: "思考",
+	samples: "样本",
+	ttftCoverage: "TTFT 覆盖",
+	modelsCount: "模型",
+	chartCalls: "按时间 · 调用次数",
+	chartTtft: "按时间 · TTFT 分位",
+	modelsTable: "按模型汇总",
+	recordsTable: "记录明细",
 	thModel: "模型",
-	thCalls: "请求",
-	thFail: "失败率",
-	thTtft: "TTFT p50",
+	thCalls: "调用",
+	thSuccess: "成功率",
+	thTtftP50: "TTFT p50",
+	thTtftP90: "TTFT p90",
+	thLatency: "平均延迟",
 	thTokps: "tok·s⁻¹",
 	thTokens: "token 合计",
+	thCost: "成本",
+	thShare: "占比",
 	thTime: "时间",
-	thClient: "客户端",
+	thProvider: "provider",
+	thThinking: "思考",
+	thCache: "缓存读/写",
+	thTtft: "首字",
+	thDuration: "耗时",
 	thStatus: "状态",
-	thLatency: "时延",
+	thSource: "来源",
 	thDetail: "拆分明细",
 	statusOk: "成功",
 	statusFailed: "失败",
-	statusCanceled: "取消",
-	empty: "该窗口没有代理记录。",
-	noDb: "未找到账本",
-	hintNoDb: "在插件设置里填 usage.db 绝对路径，或用环境变量 CLIPROXY_USAGE_DB 指定；也支持任意兼容 schema 的 SQLite 用量账本。",
-	hintTried: "已尝试的位置",
-	hintPath: "账本",
-	samples: "样本",
-	metaSaved: "缓存命中",
-	noSamples: "无样本",
-	legendCalls: "请求",
-	legendFailed: "失败/取消",
+	statusIncomplete: "未收全",
+	statusAll: "全部",
+	sourceLive: "实时",
+	sourceBackfill: "回填",
+	sourceBoth: "实时+回填",
+	legendCalls: "调用",
+	legendFailed: "失败",
 	legendP50: "p50",
 	legendP90: "p90",
+	noSamples: "该窗口没有实时 TTFT 样本",
+	empty: "还没有记录。跑一次对话，或授予 sessions 目录读取以导入历史。",
+	emptyWindow: "该窗口没有记录，换个时间窗试试。",
+	ttftNote:
+		"TTFT 只能实时采集：历史回填的条目没有首字时间（不影响 token / 真实成本 / 延迟）。覆盖率 = 有 TTFT 的调用 / 全部调用。",
+	liveOnly: "仅实时：没有 fs:read，token 与成本显示 --",
+	grant: "授权并导入历史",
+	grantHint: "读取 ~/.pi/agent/sessions（只读）以导入历史用量，插件绝不写那里。",
+	backfillOk: "回填完成",
+	backfillFail: "回填失败",
+	noticeTitle: "读不到用量",
+	retry: "重试",
+	modelFilter: "只看",
+	clearFilter: "看全部模型",
+	page: (a, b) => `第 ${a} / ${b} 页`,
+	prev: "上一页",
+	next: "下一页",
+	total: "共",
+	rows: "条",
+	ledger: "账本",
+	sessionsRoot: "会话目录",
+	lastBackfill: "上次回填",
+	never: "未跑过",
+	files: "文件",
+	stopped: "停止原因",
+	unknown: "(未知)",
+	trace: "会话",
 	kvIn: "输入",
 	kvOut: "输出",
 	kvReasoning: "推理",
 	kvCacheRead: "缓存读",
-	kvCacheCreate: "缓存写",
+	kvCacheWrite: "缓存写",
 	kvTotal: "合计",
-	retry: "重试",
-	cost: "估算成本",
-	costNote: "未知价",
-	groupBy: "分组",
-	dim: { model: "模型", provider: "路由", executor: "执行器", endpoint: "接口", client: "客户端" },
-	thKey: "名称",
-	thCost: "≈ 成本",
-	routeTable: "按维度汇总",
-	price: "价格快照",
-	priceNone: "价格未同步（成本显示 --）",
-	priceFailed: "刷新失败",
-	priceSrc: "来源",
-	priceRefresh: "刷新价目表",
-	estimate: "估算（USD，按 1M tokens 单价）",
-	overrideErr: "价格覆盖配置有误",
-	unknownShare: "未知价占比",
-	unknownCount: "未知价",
-	unknownTimes: "次",
-	// R7：跨源价格分歧（价表里同模型多源报价不一致时选中的那一个）
-	multiSource: "多源不一致",
-	multiSourceHint: "跨源价格分歧：",
-	multiSourceTimes: "次请求",
-	excluded: "已排除未知价请求",
-	allPriced: "全部有价",
-	noPriced: "无有价请求",
+	id: "记录 id",
 };
 
 const EN = {
 	title: "Usage Ledger",
-	subtitle: "EasyCLIProxyAPI usage ledger (read-only)",
-	win: { today: "Today", "7d": "7 days", "30d": "30 days" },
-	clientAll: "All clients",
-	clientPi: "pi family only",
+	subtitle: "pi-web-ui's own model calls (TTFT is live-only)",
+	win: { today: "Today", "7d": "7 days", "30d": "30 days", all: "All" },
+	bucket: { hour: "Hourly", day: "Daily" },
 	refresh: "Refresh",
+	backfill: "Backfill",
 	loading: "Loading…",
-	calls: "Requests",
+	calls: "Calls",
 	successRate: "Success rate",
-	canceled: "Canceled / failed",
+	failedIncomplete: "Failed / incomplete",
 	ttftP50: "TTFT p50",
 	ttftP90: "TTFT p90",
 	ttftP99: "TTFT p99",
 	latencyAvg: "Avg latency",
 	tokPerSec: "Avg tok·s⁻¹",
-	tokensIn: "Input tokens",
-	tokensOut: "Output tokens",
-	cacheRead: "Cache-read tokens",
-	chartCalls: "Hourly · requests",
-	chartTtft: "Hourly · TTFT percentiles",
-	modelTable: "By model",
-	eventTable: "Recent events",
+	tokensTotal: "Tokens",
+	cost: "Real cost",
+	costNote: "SDK usage.cost.total",
+	tokensIn: "input",
+	tokensOut: "output",
+	cacheRead: "cache read",
+	cacheWrite: "cache write",
+	reasoning: "reasoning",
+	samples: "samples",
+	ttftCoverage: "TTFT coverage",
+	modelsCount: "models",
+	chartCalls: "Calls over time",
+	chartTtft: "TTFT percentiles over time",
+	modelsTable: "By model",
+	recordsTable: "Call records",
 	thModel: "Model",
-	thCalls: "Requests",
-	thFail: "Fail rate",
-	thTtft: "TTFT p50",
+	thCalls: "Calls",
+	thSuccess: "Success",
+	thTtftP50: "TTFT p50",
+	thTtftP90: "TTFT p90",
+	thLatency: "Avg latency",
 	thTokps: "tok·s⁻¹",
 	thTokens: "Tokens",
+	thCost: "Cost",
+	thShare: "Share",
 	thTime: "Time",
-	thClient: "Client",
+	thProvider: "provider",
+	thThinking: "thinking",
+	thCache: "cache r/w",
+	thTtft: "first token",
+	thDuration: "duration",
 	thStatus: "Status",
-	thLatency: "Latency",
-	thDetail: "Token breakdown",
+	thSource: "Source",
+	thDetail: "Breakdown",
 	statusOk: "ok",
 	statusFailed: "failed",
-	statusCanceled: "canceled",
-	empty: "No proxy records in this window.",
-	noDb: "Ledger not found",
-	hintNoDb: "Set the absolute usage.db path in the plugin settings, or point CLIPROXY_USAGE_DB at it; any SQLite usage ledger with a compatible schema works.",
-	hintTried: "Locations tried",
-	hintPath: "Ledger",
-	samples: "samples",
-	metaSaved: "cached",
-	noSamples: "no samples",
-	legendCalls: "requests",
-	legendFailed: "failed/canceled",
+	statusIncomplete: "incomplete",
+	statusAll: "all",
+	sourceLive: "live",
+	sourceBackfill: "backfill",
+	sourceBoth: "live+backfill",
+	legendCalls: "calls",
+	legendFailed: "failed",
 	legendP50: "p50",
 	legendP90: "p90",
+	noSamples: "No live TTFT samples in this window",
+	empty: "No records yet. Run a conversation, or authorize the sessions directory to import history.",
+	emptyWindow: "No records in this window; try another range.",
+	ttftNote:
+		"TTFT can only be captured live: backfilled records have no first-token time (tokens, cost and latency are unaffected). Coverage = calls with TTFT / all calls.",
+	liveOnly: "Live only: no fs:read, tokens and cost show --",
+	grant: "Authorize & import history",
+	grantHint: "Reads ~/.pi/agent/sessions (read-only) to import past usage; the plugin never writes there.",
+	backfillOk: "Backfill done",
+	backfillFail: "Backfill failed",
+	noticeTitle: "Cannot read usage",
+	retry: "Retry",
+	modelFilter: "Only",
+	clearFilter: "All models",
+	page: (a, b) => `Page ${a} / ${b}`,
+	prev: "Prev",
+	next: "Next",
+	total: "Total",
+	rows: "rows",
+	ledger: "Ledger",
+	sessionsRoot: "Sessions",
+	lastBackfill: "Last backfill",
+	never: "never",
+	files: "files",
+	stopped: "stop reason",
+	unknown: "(unknown)",
+	trace: "session",
 	kvIn: "input",
 	kvOut: "output",
 	kvReasoning: "reasoning",
 	kvCacheRead: "cache read",
-	kvCacheCreate: "cache write",
+	kvCacheWrite: "cache write",
 	kvTotal: "total",
-	retry: "Retry",
-	cost: "Est. cost",
-	costNote: "unknown price",
-	groupBy: "Group",
-	dim: { model: "model", provider: "route", executor: "executor", endpoint: "endpoint", client: "client" },
-	thKey: "Name",
-	thCost: "≈ Cost",
-	routeTable: "Breakdown",
-	price: "Price snapshot",
-	priceNone: "Prices not synced (cost shows --)",
-	priceFailed: "refresh failed",
-	priceSrc: "sources",
-	priceRefresh: "Refresh prices",
-	estimate: "estimate (USD per 1M tokens)",
-	overrideErr: "price overrides invalid",
-	unknownShare: "unknown-price share",
-	unknownCount: "unknown price",
-	unknownTimes: " call(s)",
-	multiSource: "multi-source",
-	multiSourceHint: "cross-source price divergence: ",
-	multiSourceTimes: " call(s)",
-	excluded: "unknown-price calls excluded",
-	allPriced: "all priced",
-	noPriced: "no priced call",
+	id: "record id",
 };
 
 function detectLang() {
@@ -250,43 +285,48 @@ function fmtAxisMs(ms) {
 }
 
 function fmtRate(x) {
+	if (x === null || x === undefined) return "--";
 	const v = Number(x);
 	if (!Number.isFinite(v)) return "--";
 	return `${(v * 100).toFixed(1)}%`;
 }
 
+export function fmtShare(x) {
+	const v = Number(x);
+	if (x === null || x === undefined || !Number.isFinite(v)) return "--";
+	return `${(v * 100).toFixed(v > 0 && v < 0.01 ? 2 : 1)}%`;
+}
+
 function fmtTokps(x) {
+	if (x === null || x === undefined) return "--";
 	const v = Number(x);
 	if (!Number.isFinite(v) || v < 0) return "--";
 	return v.toFixed(v < 10 ? 2 : 0);
 }
 
-export function fmtCost(amount, d) {
+/** 真实成本（USD）。没有成本字段 → `--`（不是 $0）。 */
+export function fmtCost(amount) {
 	const v = Number(amount);
 	if (amount === null || amount === undefined || !Number.isFinite(v)) return "--";
-	const digits = v < 1 ? 4 : 2;
-	return `≈$${v.toFixed(digits)}`;
+	return `$${v.toFixed(v < 1 ? 4 : 2)}`;
 }
 
-function fmtPct(x) {
-	const v = Number(x);
-	if (!Number.isFinite(v)) return "--";
-	return `${(v * 100).toFixed(v > 0 && v < 0.01 ? 2 : 1)}%`;
-}
-
-function fmtHour(hour, lang) {
-	// 服务端下发的是本地小时键 `YYYY-MM-DDTHH:00:00`
+function fmtHour(hour, _lang) {
+	// 服务端下发的是本地时间键：小时 `YYYY-MM-DDTHH:00:00` 或天 `YYYY-MM-DD`
 	const s = String(hour ?? "");
 	const m = s.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2})/);
-	if (!m) return s;
-	return `${m[2]}-${m[3]} ${m[4]}:00`;
+	if (m) return `${m[2]}-${m[3]} ${m[4]}:00`;
+	const d = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+	if (d) return `${d[2]}-${d[3]}`;
+	return s;
 }
 
-function fmtTime(iso) {
-	const s = String(iso ?? "");
-	const m = s.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/);
-	if (!m) return s;
-	return `${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`;
+function fmtTime(ts) {
+	const v = Number(ts);
+	if (!Number.isFinite(v) || v <= 0) return "--";
+	const d = new Date(v);
+	const p2 = (n) => String(n).padStart(2, "0");
+	return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
 }
 
 function apiBase() {
@@ -326,6 +366,7 @@ function ensureStyles() {
 		}
 		.cps-btn:hover { border-color: var(--accent, #7c5cff); }
 		.cps-btn:disabled { opacity: 0.55; cursor: default; }
+		.cps-btn.primary { border-color: var(--accent, #7c5cff); color: var(--accent, #7c5cff); }
 		.cps-cards { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); }
 		.cps-card {
 			background: var(--bg-elev2, #1a1d26); border: 1px solid var(--border, #2a2e3a);
@@ -339,6 +380,7 @@ function ensureStyles() {
 			border-radius: 10px; padding: 10px 12px; min-width: 0;
 		}
 		.cps-panel > h3 { margin: 0 0 8px; font-size: 12.5px; font-weight: 600; color: var(--text-dim, #8b90a0); }
+		.cps-hint { color: var(--text-faint, #6b7080); font-size: 11.5px; margin-top: 6px; overflow-wrap: anywhere; }
 		.cps-legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11.5px; color: var(--text-faint, #6b7080); margin-top: 4px; }
 		.cps-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
 		.cps-svg { display: block; width: 100%; height: auto; overflow: visible; }
@@ -351,7 +393,7 @@ function ensureStyles() {
 		}
 		.cps-tbl th:first-child, .cps-tbl td:first-child { text-align: left; }
 		.cps-tbl th { color: var(--text-dim, #8b90a0); font-weight: 500; font-size: 11.5px; }
-		.cps-tbl tbody tr { cursor: pointer; }
+		.cps-tbl tbody tr[data-model], .cps-tbl tbody tr[data-rid] { cursor: pointer; }
 		.cps-tbl tbody tr:hover { background: color-mix(in srgb, var(--accent, #7c5cff) 10%, transparent); }
 		.cps-tbl td.mono { font-variant-numeric: tabular-nums; }
 		.cps-detail td {
@@ -379,6 +421,13 @@ function ensureStyles() {
 		.cps-empty { color: var(--text-faint, #6b7080); text-align: center; padding: 18px 0; font-size: 12.5px; }
 		.cps-meta { color: var(--text-faint, #6b7080); font-size: 11.5px; overflow-wrap: anywhere; }
 		.cps-meta code { font-size: 11.5px; }
+		.cps-filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+		.cps-chip {
+			display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 999px;
+			border: 1px solid color-mix(in srgb, var(--accent, #7c5cff) 45%, transparent);
+			color: var(--accent, #7c5cff); font-size: 11.5px; cursor: pointer; background: transparent; font-family: inherit;
+		}
+		.cps-pager { display: flex; align-items: center; gap: 8px; justify-content: flex-end; font-size: 11.5px; color: var(--text-faint, #6b7080); }
 		.cps-c-red { color: var(--red, #ef4444); }
 		.cps-c-amber { color: var(--amber, #f59e0b); }
 		.cps-c-dim { color: var(--text-dim, #8b90a0); }
@@ -431,16 +480,19 @@ export function callsChart(hours, d) {
 	hours.forEach((h, i) => {
 		const calls = Number(h.calls) || 0;
 		const bad = Math.min(Number(h.bad) || 0, calls);
+		const good = calls - bad;
 		const x = PAD_L + i * step + (step - barW) / 2;
-		const yTop = yOf(calls, max);
-		const yBadTop = yOf(calls - bad, max);
 		const bottom = yOf(0, max);
+		// 整条柱（成功 + 失败）从 0 线往上长：y 取「成功部分」的顶，高度到 0 线为止
+		const yGoodTop = yOf(good, max);
 		parts.push(
-			`<rect x="${x.toFixed(1)}" y="${yBadTop.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(1, bottom - yTop).toFixed(1)}" fill="var(--accent, #7c5cff)" opacity="0.85" rx="1"><title>${esc(`${fmtHour(h.hour)} · ${d.legendCalls} ${calls} / ${d.legendFailed} ${bad}`)}</title></rect>`,
+			`<rect x="${x.toFixed(1)}" y="${yGoodTop.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(0, bottom - yGoodTop).toFixed(1)}" fill="var(--accent, #7c5cff)" opacity="0.85" rx="1"><title>${esc(`${fmtHour(h.hour)} · ${d.legendCalls} ${calls} / ${d.legendFailed} ${bad}`)}</title></rect>`,
 		);
 		if (bad > 0) {
+			// 失败/取消段叠在柱顶：从柱子顶部往下 bad 那么多，永不越过 0 线
+			const yTop = yOf(calls, max);
 			parts.push(
-				`<rect x="${x.toFixed(1)}" y="${yBadTop.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(1, yBadTop - yTop).toFixed(1)}" fill="var(--red, #ef4444)" opacity="0.9" rx="1"/>`,
+				`<rect x="${x.toFixed(1)}" y="${yTop.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(1, yGoodTop - yTop).toFixed(1)}" fill="var(--red, #ef4444)" opacity="0.9" rx="1"><title>${esc(`${fmtHour(h.hour)} · ${d.legendFailed} ${bad}`)}</title></rect>`,
 			);
 		}
 	});
@@ -517,254 +569,212 @@ function card(label, value, note, title, valueHtml) {
 	}</div>`;
 }
 
-/**
- * 跨源价格分歧小标记（R7 / F-11）：金额后跟一个小标签，悬停说明分歧次数。
- * 没次数就什么都不画（绝不把「没分歧」也画成痕）。
- * @param {{ multiSourceCalls?: number, multiSourceRatio?: number|null }|null} cost
- */
-export function multiMark(cost, d) {
-	const n = Number(cost?.multiSourceCalls) || 0;
-	if (!(n > 0)) return "";
-	const title = `${d.multiSourceHint}${fmtInt(n)} ${d.multiSourceTimes}`;
-	return ` <span class="cps-badge multi" title="${esc(title)}">${esc(d.multiSource)}</span>`;
-}
-
-/**
- * 未知价占比（容错版）：优先 `unknownRatio`，回落旧名 `unknownRate` 与自算；
- * 总请求数为 0 时返回 "--"（绝不显示 0%）。
- * @param {{ amount?: number|null, totalCalls?: number, pricedCalls?: number, unknownCalls?: number, unknownRatio?: number|null, unknownRate?: number|null }|null} cost
- */
-export function costShare(cost) {
-	if (!cost || typeof cost !== "object") return "--";
-	const priced = Number(cost.pricedCalls) || 0;
-	const unknown = Number(cost.unknownCalls) || 0;
-	const total =
-		Number.isFinite(Number(cost.totalCalls)) && cost.totalCalls !== undefined
-			? Number(cost.totalCalls)
-			: priced + unknown;
-	if (!(total > 0)) return "--";
-	const ratio =
-		typeof cost.unknownRatio === "number"
-			? cost.unknownRatio
-			: typeof cost.unknownRate === "number"
-				? cost.unknownRate
-				: unknown / total;
-	return fmtPct(ratio);
-}
-
-/** 悬停标题：估算口径 + 样本/未知价 + 跨源分歧（分组表格与指标卡共用）。 */
-function costExtraTitle(cost, d) {
-	const n = Number(cost?.multiSourceCalls) || 0;
-	return n > 0 ? ` · ${d.multiSourceHint}${fmtInt(n)} ${d.multiSourceTimes}` : "";
-}
-
-function groupCostTitle(cost, d) {
-	if (!cost) return d.priceNone;
-	const unknown =
-		cost.unknownCalls > 0
-			? ` · ${d.excluded} ${fmtInt(cost.unknownCalls)} ${d.unknownTimes}（${costShare(cost)}）`
-			: ` · ${d.allPriced}`;
-	return `${d.estimate} · ${d.samples} ${cost.pricedCalls}/${cost.totalCalls}${unknown}${costExtraTitle(cost, d)}`;
-}
-
-function renderCards(summary, d) {
-	const s = summary;
-	const rate = s.calls > 0 ? fmtRate(s.successRate) : "--";
-	const cost = s.cost;
-	// R5：必须显示「未知价 N 次（占 X%）」；0 请求时占比是 null（显示 --，绝不显示 0%）
-	const share = costShare(cost);
-	const costNote = cost
-		? cost.totalCalls > 0
-			? `${d.unknownCount} ${fmtInt(cost.unknownCalls)} ${d.unknownTimes}（${share}）`
-			: `${d.estimate} · --`
-		: d.priceNone;
-	const costTitle = cost
-		? `${d.estimate}${cost.unknownCalls > 0 ? ` · ${d.excluded} ${fmtInt(cost.unknownCalls)} ${d.unknownTimes}（${share}）` : " · " + d.allPriced}${costExtraTitle(cost, d)}`
-		: d.priceNone;
+/** 指标卡组。`s` = /api/summary 的 summary；`d` = 文案。 */
+export function renderCards(s, d) {
+	if (!s) return "";
+	const calls = Number(s.calls) || 0;
+	const ttft = s.ttft ?? { samples: 0, p50: null, p90: null, p99: null, coverage: null };
+	const tokens = s.tokens ?? {};
+	const cost = s.cost ?? { amount: null, unpricedCalls: 0, totalCalls: 0 };
+	const tokNote = `${s.tokPerSecSamples ?? 0} ${d.samples}`;
+	const tokenNote = `${d.tokensIn} ${fmtInt(tokens.input)} · ${d.tokensOut} ${fmtInt(tokens.output)} · ${d.cacheRead} ${fmtInt(tokens.cacheRead)} · ${d.cacheWrite} ${fmtInt(tokens.cacheWrite)} · ${d.reasoning} ${fmtInt(tokens.reasoning)}`;
+	const costNote =
+		cost.amount === null
+			? `${d.costNote} · ${d.samples} 0`
+			: `${d.costNote}${cost.unpricedCalls ? ` · -- ${cost.unpricedCalls}` : ""}`;
 	return `<div class="cps-cards">
-		${card(d.calls, fmtInt(s.calls), `${d.canceled}: ${s.failed} / ${s.canceled}`)}
-		${card(d.successRate, rate, `${d.statusOk} ${fmtInt(s.success)}`)}
-		${card(d.cost, fmtCost(cost?.amount ?? null, d), costNote, costTitle, `${esc(fmtCost(cost?.amount ?? null, d))}${multiMark(cost, d)}`)}
-		${card(d.ttftP50, fmtMs(s.ttft.p50), `${d.samples} ${s.ttft.samples}`)}
-		${card(d.ttftP90, fmtMs(s.ttft.p90), s.ttft.p99 ? `p99 ${fmtMs(s.ttft.p99)}` : "")}
-		${card(d.latencyAvg, fmtMs(s.latencyAvg), s.latencyMax ? `max ${fmtMs(s.latencyMax)}` : "")}
-		${card(d.tokPerSec, fmtTokps(s.tokPerSec), `${d.samples} ${s.tokPerSecSamples}`)}
-		${card(d.tokensIn, fmtInt(s.tokens.input), "")}
-		${card(d.tokensOut, fmtInt(s.tokens.output), s.tokens.reasoning ? `${d.kvReasoning} ${fmtInt(s.tokens.reasoning)}` : "")}
-		${card(d.cacheRead, fmtInt(s.tokens.cacheRead), s.tokens.cacheCreation ? `${d.kvCacheCreate} ${fmtInt(s.tokens.cacheCreation)}` : "")}
+		${card(d.calls, fmtInt(calls), `${s.models ?? 0} ${d.modelsCount}`, `调用次数：${calls}`)}
+		${card(d.successRate, fmtRate(s.successRate), `${d.statusOk} ${s.ok ?? 0}`, `成功率 = 成功 / 全部调用（${s.ok ?? 0}/${calls}）`)}
+		${card(
+			d.failedIncomplete,
+			`${fmtInt(s.failed ?? 0)} / ${fmtInt(s.incomplete ?? 0)}`,
+			`${d.statusFailed} / ${d.statusIncomplete}`,
+			`失败（status=error）与未收全（缺 message 或 usage）分开计数`,
+		)}
+		${card(d.ttftP50, ttft.p50 === null ? "--" : fmtMs(ttft.p50), `${d.samples} ${ttft.samples ?? 0}`, `首字时间 p50（只统计实时采集的调用）`)}
+		${card(d.ttftP90, ttft.p90 === null ? "--" : fmtMs(ttft.p90), ttft.coverage === null ? "" : `${d.ttftCoverage} ${fmtRate(ttft.coverage)}`, `首字时间 p90`)}
+		${card(d.ttftP99, ttft.p99 === null ? "--" : fmtMs(ttft.p99), `${d.samples} ${ttft.samples ?? 0}`, `首字时间 p99`)}
+		${card(d.latencyAvg, s.latencyAvg === null ? "--" : fmtMs(s.latencyAvg), `${d.samples} ${s.latencySamples ?? 0}`, `单次调用耗时均值（会话 durationMs / turn 时长）`)}
+		${card(d.tokPerSec, fmtTokps(s.tokPerSec), tokNote, `outputTokens / (durationMs/1000) 的均值`)}
+		${card(d.tokensTotal, fmtInt(tokens.total), tokenNote, `token 合计：${tokenNote}`)}
+		${card(d.cost, fmtCost(cost.amount), costNote, `真实成本：SDK usage.cost.total 求和`)}
 	</div>`;
 }
 
-/** 按维度汇总表（模型 / 路由 / 执行器 / 接口 / 客户端），带估算成本与未知价占比。 */
-function renderGroups(groups, d) {
-	if (!groups?.length) return `<div class="cps-empty">${esc(d.empty)}</div>`;
-	const rows = groups
-		.map(
-			(g) => `<tr>
-			<td>${esc(g.key)}</td>
-			<td class="mono">${esc(fmtInt(g.calls))}</td>
-			<td class="mono ${g.bad > 0 ? "cps-c-red" : "cps-c-dim"}">${esc(g.calls > 0 ? fmtRate(g.failRate) : "--")}</td>
-			<td class="mono">${esc(fmtMs(g.ttftP50))}</td>
-			<td class="mono">${esc(fmtMs(g.ttftP90))}</td>
-			<td class="mono">${esc(fmtTokps(g.tokPerSec))}</td>
-			<td class="mono">${esc(fmtInt(g.tokens.total))}</td>
-			<td class="mono" title="${esc(groupCostTitle(g.cost, d))}">${esc(fmtCost(g.cost?.amount ?? null, d))}${multiMark(g.cost, d)}</td>
-		</tr>`,
-		)
+/** 按模型汇总表（点行 → 只看该模型）。 */
+function renderModels(rows, d) {
+	if (!Array.isArray(rows) || !rows.length) return `<div class="cps-empty">${esc(d.emptyWindow)}</div>`;
+	const body = rows
+		.map((row) => {
+			const ttft = row.ttft ?? {};
+			return `<tr data-model="${esc(row.model)}" title="${esc(`${d.modelFilter} ${row.model}`)}">
+				<td>${esc(row.model)}</td>
+				<td class="mono">${esc(fmtInt(row.calls))}</td>
+				<td class="mono">${esc(fmtRate(row.successRate))}</td>
+				<td class="mono">${esc(ttft.p50 === null || ttft.p50 === undefined ? "--" : fmtMs(ttft.p50))}</td>
+				<td class="mono">${esc(ttft.p90 === null || ttft.p90 === undefined ? "--" : fmtMs(ttft.p90))}</td>
+				<td class="mono">${esc(row.latencyAvg === null || row.latencyAvg === undefined ? "--" : fmtMs(row.latencyAvg))}</td>
+				<td class="mono">${esc(fmtTokps(row.tokPerSec))}</td>
+				<td class="mono" title="${esc(`${d.tokensIn} ${row.tokens?.input ?? 0} · ${d.tokensOut} ${row.tokens?.output ?? 0} · ${d.cacheRead} ${row.tokens?.cacheRead ?? 0} · ${d.cacheWrite} ${row.tokens?.cacheWrite ?? 0} · ${d.reasoning} ${row.tokens?.reasoning ?? 0}`)}">${esc(fmtInt(row.tokens?.total ?? 0))}</td>
+				<td class="mono">${esc(fmtCost(row.cost?.amount ?? null))}</td>
+				<td class="mono">${esc(fmtShare(row.costShare ?? row.callShare ?? null))}</td>
+			</tr>`;
+		})
 		.join("");
-	return `<div class="cps-tbl-wrap"><table class="cps-tbl">
+	return `<div class="cps-tbl-wrap"><table class="cps-tbl cps-models">
 		<thead><tr>
-			<th>${esc(d.thKey)}</th><th>${esc(d.thCalls)}</th><th>${esc(d.thFail)}</th>
-			<th>${esc(d.thTtft)}</th><th>p90</th><th>${esc(d.thTokps)}</th>
-			<th>${esc(d.thTokens)}</th><th>${esc(d.thCost)}</th>
-		</tr></thead><tbody>${rows}</tbody></table></div>`;
+			<th>${esc(d.thModel)}</th><th>${esc(d.thCalls)}</th><th>${esc(d.thSuccess)}</th>
+			<th>${esc(d.thTtftP50)}</th><th>${esc(d.thTtftP90)}</th><th>${esc(d.thLatency)}</th>
+			<th>${esc(d.thTokps)}</th><th>${esc(d.thTokens)}</th><th>${esc(d.thCost)}</th><th>${esc(d.thShare)}</th>
+		</tr></thead>
+		<tbody>${body}</tbody>
+	</table></div>`;
 }
 
-function statusBadge(ev, d) {
-	if (ev.canceled) return `<span class="cps-badge cancel">${esc(d.statusCanceled)}</span>`;
-	if (ev.failed) return `<span class="cps-badge bad">${esc(d.statusFailed)}</span>`;
+function statusBadge(status, d) {
+	if (status === "error") return `<span class="cps-badge bad">${esc(d.statusFailed)}</span>`;
+	if (status === "incomplete") return `<span class="cps-badge cancel">${esc(d.statusIncomplete)}</span>`;
 	return `<span class="cps-badge ok">${esc(d.statusOk)}</span>`;
 }
 
-function renderEvents(events, d, expandedId) {
-	if (!events?.length) return `<div class="cps-empty">${esc(d.empty)}</div>`;
-	const rows = events
-		.map((ev) => {
-			const tokps =
-				ev.ttftMs !== null && ev.latencyMs > ev.ttftMs && ev.outputTokens > 0
-					? fmtTokps(ev.outputTokens / ((ev.latencyMs - ev.ttftMs) / 1000))
-					: "--";
-			const main = `<tr data-rid="${ev.id}">
-				<td>${esc(fmtTime(ev.timestamp))}</td>
-				<td>${esc(ev.client)}</td>
-				<td>${esc(ev.model || "--")}</td>
-				<td>${statusBadge(ev, d)}</td>
-				<td class="mono">${esc(fmtMs(ev.ttftMs))}</td>
-				<td class="mono">${esc(fmtMs(ev.latencyMs))}</td>
-				<td class="mono">${esc(tokps)}</td>
-				<td class="mono">${esc(fmtInt(ev.totalTokens || ev.inputTokens + ev.outputTokens))}</td>
-				<td class="mono">${esc(fmtCost(ev.costAmount ?? null, d))}</td>
+function sourceLabel(record, d) {
+	const sources = Array.isArray(record.sources) && record.sources.length ? record.sources : [record.source];
+	if (sources.length > 1) return d.sourceBoth;
+	return sources[0] === "live" ? d.sourceLive : d.sourceBackfill;
+}
+
+/** 记录明细表（分页 + 点开明细）。 */
+function renderRecords(state, d) {
+	const list = Array.isArray(state.records) ? state.records : [];
+	if (!list.length) return `<div class="cps-empty">${esc(state.summary?.calls ? d.emptyWindow : d.empty)}</div>`;
+	const rows = list
+		.map((r) => {
+			const open = state.expandedId === r.id;
+			const rid = esc(r.id);
+			const tokps = Number(r.outputTokens) > 0 && Number(r.durationMs) > 0 ? Number(r.outputTokens) / (Number(r.durationMs) / 1000) : null;
+			const main = `<tr data-rid="${rid}">
+				<td class="mono">${esc(fmtTime(r.ts))}</td>
+				<td>${esc(r.model ?? d.unknown)}</td>
+				<td class="cps-c-dim">${esc(r.provider ?? "--")}</td>
+				<td class="cps-c-dim">${esc(r.thinkingLevel ?? "--")}</td>
+				<td class="mono">${esc(fmtInt(r.totalTokens ?? 0))}</td>
+				<td class="mono cps-c-dim">${esc(`${fmtInt(r.cacheReadTokens ?? 0)}/${fmtInt(r.cacheWriteTokens ?? 0)}`)}</td>
+				<td class="mono">${esc(r.ttftMs === null || r.ttftMs === undefined ? "--" : fmtMs(r.ttftMs))}</td>
+				<td class="mono">${esc(r.durationMs === null || r.durationMs === undefined ? "--" : fmtMs(r.durationMs))}</td>
+				<td class="mono">${esc(fmtTokps(tokps))}</td>
+				<td class="mono">${esc(fmtCost(r.costUsd))}</td>
+				<td>${statusBadge(r.status, d)}</td>
 			</tr>`;
-			if (ev.id !== expandedId) return main;
-			const detail = `<tr class="cps-detail"><td colspan="9">
-				${esc(d.thDetail)}: ${esc(d.kvIn)} <b>${esc(fmtInt(ev.inputTokens))}</b> ·
-				${esc(d.kvOut)} <b>${esc(fmtInt(ev.outputTokens))}</b> ·
-				${esc(d.kvReasoning)} <b>${esc(fmtInt(ev.reasoningTokens))}</b> ·
-				${esc(d.kvCacheRead)} <b>${esc(fmtInt(ev.cacheReadTokens))}</b> ·
-				${esc(d.kvTotal)} <b>${esc(fmtInt(ev.totalTokens))}</b> ·
-				${esc(d.cost)} <b>${esc(fmtCost(ev.costAmount ?? null, d))}</b>
+			if (!open) return main;
+			const detail = `<tr class="cps-detail"><td colspan="11">
+				${esc(d.thDetail)}：<b>${esc(d.kvIn)}</b> ${esc(fmtInt(r.inputTokens ?? 0))} ·
+				<b>${esc(d.kvOut)}</b> ${esc(fmtInt(r.outputTokens ?? 0))} ·
+				<b>${esc(d.kvCacheRead)}</b> ${esc(fmtInt(r.cacheReadTokens ?? 0))} ·
+				<b>${esc(d.kvCacheWrite)}</b> ${esc(fmtInt(r.cacheWriteTokens ?? 0))} ·
+				<b>${esc(d.kvReasoning)}</b> ${esc(fmtInt(r.reasoningTokens ?? 0))} ·
+				<b>${esc(d.kvTotal)}</b> ${esc(fmtInt(r.totalTokens ?? 0))}<br/>
+				${esc(d.thSource)}：${esc(sourceLabel(r, d))} ·
+				${esc(d.stopped)}：${esc(r.stopReason ?? "--")} ·
+				${esc(d.id)}：<code>${esc(r.id)}</code>
 			</td></tr>`;
 			return main + detail;
 		})
 		.join("");
-	return `<div class="cps-tbl-wrap"><table class="cps-tbl">
+	const pages = Math.max(1, Number(state.pages) || 1);
+	const page = Math.min(pages, Math.max(1, Number(state.page) || 1));
+	const pager = `<div class="cps-pager">
+		<span>${esc(d.total)} ${esc(fmtInt(state.total ?? list.length))} ${esc(d.rows)} · ${esc(d.page(page, pages))}</span>
+		<button class="cps-btn" data-act="page" data-value="${page - 1}" ${page <= 1 ? "disabled" : ""}>${esc(d.prev)}</button>
+		<button class="cps-btn" data-act="page" data-value="${page + 1}" ${page >= pages ? "disabled" : ""}>${esc(d.next)}</button>
+	</div>`;
+	return `<div class="cps-tbl-wrap"><table class="cps-tbl cps-records">
 		<thead><tr>
-			<th>${esc(d.thTime)}</th><th>${esc(d.thClient)}</th><th>${esc(d.thModel)}</th>
-			<th>${esc(d.thStatus)}</th><th>TTFT</th><th>${esc(d.thLatency)}</th>
-			<th>${esc(d.thTokps)}</th><th>${esc(d.thTokens)}</th><th>${esc(d.thCost)}</th>
-		</tr></thead><tbody>${rows}</tbody></table></div>`;
+			<th>${esc(d.thTime)}</th><th>${esc(d.thModel)}</th><th>${esc(d.thProvider)}</th><th>${esc(d.thThinking)}</th>
+			<th>${esc(d.thTokens)}</th><th>${esc(d.thCache)}</th><th>${esc(d.thTtft)}</th><th>${esc(d.thDuration)}</th>
+			<th>${esc(d.thTokps)}</th><th>${esc(d.thCost)}</th><th>${esc(d.thStatus)}</th>
+		</tr></thead>
+		<tbody>${rows}</tbody>
+	</table></div>${pager}`;
 }
 
+/** 顶部降级/授权提示（只在需要时出现）。 */
 function renderNotice(state, d) {
-	const err = state.error;
-	if (!err) return "";
-	// 发现链给的结构化空态（db-not-found / bad-path）与其它错误分开标题
-	const title = err.code === "db-not-found" || err.code === "bad-path" ? d.noDb : (err.code ?? "error");
-	const detail = state.lang === "en" ? err.reasonEn : err.reason;
-	const path = err.meta?.dbPath || err.path || "";
-	const tried = Array.isArray(err.candidates) ? err.candidates.filter((p) => typeof p === "string" && p) : [];
-	const hint = (state.lang === "en" ? err.hintEn : err.hint) || d.hintNoDb;
+	const meta = state.meta ?? {};
+	const grant = meta.grant ?? null;
+	const needsGrant = Boolean(grant?.required);
+	const error = state.error;
+	if (!error && !needsGrant) return "";
+	const reason = error?.reason ?? grant?.reason ?? d.liveOnly;
+	const reasonEn = error?.reasonEn ?? grant?.reasonEn ?? "";
+	const hint = error?.hint ?? grant?.hint ?? "";
+	const lines = [
+		`${esc(reason)}${reasonEn && reasonEn !== reason ? ` · ${esc(reasonEn)}` : ""}`,
+		hint ? `<p><code>${esc(hint)}</code></p>` : "",
+	];
+	const tried = Array.isArray(error?.candidates) && error.candidates.length
+		? `<details class="cps-tried"><summary>${esc(d.sessionsRoot)}</summary><ul>${error.candidates
+				.map((c) => `<li>${esc(c)}</li>`)
+				.join("")}</ul></details>`
+		: "";
 	return `<div class="cps-notice">
-		<h3>${esc(String(title))}</h3>
-		<p>${esc(String(detail || ""))}</p>
-		${path ? `<p>${esc(d.hintPath)}: <code>${esc(path)}</code></p>` : ""}
-		${
-			tried.length
-				? `<details class="cps-tried"><summary>${esc(d.hintTried)}（${tried.length}）</summary><ul>${tried
-						.slice(0, 30)
-						.map((p) => `<li><code>${esc(p)}</code></li>`)
-						.join("")}</ul></details>`
-				: ""
-		}
-		<p>${esc(String(hint || ""))}</p>
-		<button class="cps-btn" data-act="refresh">${esc(d.retry)}</button>
+		<h3>${esc(d.noticeTitle)}</h3>
+		<p>${lines.join("")}</p>
+		${needsGrant ? `<p>${esc(d.grantHint)}</p>` : ""}
+		${tried}
+		<div class="cps-filters">
+			<button class="cps-btn" data-act="refresh">${esc(d.retry)}</button>
+			${needsGrant ? `<button class="cps-btn primary" data-act="grant">${esc(d.grant)}</button>` : ""}
+		</div>
 	</div>`;
 }
 
-/** 价格快照状态行：来源 + 抓取时间 + 失败态（金额一律标注「估算」）。 */
-function renderPriceLine(price, d) {
-	if (!price) return "";
-	const when = price.fetchedAt ? new Date(price.fetchedAt).toLocaleString() : "--";
-	const parts = [];
-	parts.push(`${d.price}: <code>${esc(when)}</code>`);
-	if (price.available) {
-		parts.push(`${esc(d.priceSrc)}: ${esc((price.sourceLabels ?? []).join(" / ") || "--")}`);
-		parts.push(`${esc(d.estimate)}`);
-		if (price.unknownRatio !== undefined && price.unknownRatio !== null) {
-			parts.push(`${esc(d.unknownShare)} ${esc(fmtPct(price.unknownRatio))}`);
-		}
-	} else {
-		parts.push(`<span class="cps-c-amber">${esc(d.priceNone)}</span>`);
-	}
-	if (price.failedSources?.length) {
-		parts.push(`<span class="cps-c-amber">${esc(d.priceFailed)}: ${esc(price.failedSources.join(" / "))}</span>`);
-	}
-	if (price.refreshFailedAt) {
-		parts.push(
-			`<span class="cps-c-amber">${esc(d.priceFailed)} @ ${esc(new Date(price.refreshFailedAt).toLocaleString())}</span>`,
-		);
-	}
-	if (price.overridesError) parts.push(`<span class="cps-c-amber">${esc(d.overrideErr)}</span>`);
-	return `<div class="cps-meta">${parts.join(" · ")} <button class="cps-btn" data-act="prices">${esc(d.priceRefresh)}</button></div>`;
-}
-
-function segmented(values, current, act) {
-	return `<div class="cps-seg">${values
+function segmented(values, current, act, labels) {
+	return `<span class="cps-seg">${values
 		.map(
 			(v) =>
-				`<button data-act="${act}" data-value="${esc(v.value)}" class="${v.value === current ? "on" : ""}">${esc(v.label)}</button>`,
+				`<button data-act="${esc(act)}" data-value="${esc(v)}" class="${current === v ? "on" : ""}">${esc(labels[v] ?? v)}</button>`,
 		)
-		.join("")}</div>`;
+		.join("")}</span>`;
 }
 
-const GROUP_KEYS = ["model", "provider", "executor", "endpoint", "client"];
+/** 顶栏状态行：账本规模 / 会话目录 / 上次回填 / 模式。 */
+function renderMetaLine(state, d) {
+	const meta = state.meta ?? {};
+	const ledger = meta.ledger ?? {};
+	const backfill = meta.backfill ?? null;
+	const last = backfill?.finishedAt ? fmtTime(backfill.finishedAt) : d.never;
+	const parts = [
+		`${esc(d.ledger)} ${esc(fmtInt(ledger.records ?? 0))} ${esc(d.rows)}`,
+		`${esc(d.sessionsRoot)} <code>${esc(meta.sessionsRoot ?? "--")}</code>`,
+		`${esc(d.lastBackfill)} ${esc(last)}${backfill ? ` · ${esc(fmtInt(backfill.files ?? 0))} ${esc(d.files)}` : ""}`,
+	];
+	if (meta.mode === "live-only") parts.push(`<span class="cps-c-amber">${esc(d.liveOnly)}</span>`);
+	return `<div class="cps-meta">${parts.join(" · ")}</div>`;
+}
 
+/** 整页渲染。 */
 function renderDashboard(state, d) {
-	const segWin = segmented(
-		[
-			{ value: "today", label: d.win.today },
-			{ value: "7d", label: d.win["7d"] },
-			{ value: "30d", label: d.win["30d"] },
-		],
-		state.window,
-		"window",
-	);
-	const segClient = segmented(
-		[
-			{ value: "all", label: d.clientAll },
-			{ value: "pi", label: d.clientPi },
-		],
-		state.client,
-		"client",
-	);
-	const segGroup = segmented(
-		GROUP_KEYS.map((key) => ({ value: key, label: d.dim[key] })),
-		state.groupBy,
-		"groupBy",
-	);
-	const meta = state.summary?.meta;
-	const price = meta?.price ?? null;
-	const metaLine = meta
-		? `${d.hintPath}: <code>${esc(meta.dbPath || "--")}</code> · ${esc(new Date(meta.generatedAt).toLocaleTimeString())}${
-				meta.cached ? ` · ${esc(d.metaSaved)}` : ""
-			}`
+	const summary = state.summary;
+	const meta = state.meta ?? {};
+	const ok = Boolean(summary) && state.error === null;
+	const winSeg = segmented(["today", "7d", "30d", "all"], state.window, "window", d.win);
+	const bucketSeg = segmented(["hour", "day"], state.bucket, "bucket", d.bucket);
+	const statusSeg = segmented(["all", "ok", "error", "incomplete"], state.status, "status", {
+		all: d.statusAll,
+		ok: d.statusOk,
+		error: d.statusFailed,
+		incomplete: d.statusIncomplete,
+	});
+	const modelChip = state.model
+		? `<button class="cps-chip" data-act="clearModel" title="${esc(d.clearFilter)}">${esc(d.modelFilter)} ${esc(state.model)} ✕</button>`
 		: "";
-	const body = state.summary?.ok
-		? `${renderCards(state.summary.summary, d)}
+	const series = Array.isArray(state.series) ? state.series : [];
+	const body = ok
+		? `${renderCards(summary, d)}
 			<div class="cps-grid2">
 				<div class="cps-panel">
 					<h3>${esc(d.chartCalls)}</h3>
-					${callsChart(state.hours ?? [], d)}
+					${callsChart(series, d)}
 					${legend([
 						{ color: "var(--accent, #7c5cff)", label: d.legendCalls },
 						{ color: "var(--red, #ef4444)", label: d.legendFailed },
@@ -772,31 +782,37 @@ function renderDashboard(state, d) {
 				</div>
 				<div class="cps-panel">
 					<h3>${esc(d.chartTtft)}</h3>
-					${ttftChart(state.hours ?? [], d)}
+					${ttftChart(series, d)}
 					${legend([
 						{ color: "var(--accent, #7c5cff)", label: d.legendP50 },
 						{ color: "var(--amber, #f59e0b)", label: d.legendP90 },
 					])}
+					<div class="cps-hint">${esc(d.ttftNote)}</div>
 				</div>
 			</div>
 			<div class="cps-panel">
-				<h3>${esc(d.routeTable)} · ${esc(d.groupBy)}：${esc(d.dim[state.groupBy] ?? state.groupBy)}</h3>
-				${renderGroups(state.summary.groups, d)}
+				<h3>${esc(d.modelsTable)}</h3>
+				${renderModels(state.models ?? [], d)}
 			</div>
 			<div class="cps-panel">
-				<h3>${esc(d.eventTable)}</h3>
-				${renderEvents(state.events ?? [], d, state.expandedId)}
+				<h3>${esc(d.recordsTable)}</h3>
+				<div class="cps-filters">${statusSeg}${modelChip}</div>
+				${renderRecords(state, d)}
 			</div>`
 		: `${renderNotice(state, d)}${state.loading ? `<div class="cps-empty">${esc(d.loading)}</div>` : ""}`;
+	const grantBtn = meta.grant?.required
+		? `<button class="cps-btn primary" data-act="grant">${esc(d.grant)}</button>`
+		: "";
 	return `<div class="cps-head">
 			<span class="cps-title">📊 ${esc(d.title)}</span>
 			<span class="cps-sub">${esc(d.subtitle)}</span>
 			<span class="cps-spacer"></span>
-			${segWin}${segClient}${segGroup}
+			${winSeg}${bucketSeg}${grantBtn}
+			<button class="cps-btn" data-act="backfill" ${state.loading ? "disabled" : ""}>${esc(d.backfill)}</button>
 			<button class="cps-btn" data-act="refresh" ${state.loading ? "disabled" : ""}>${esc(state.loading ? d.loading : d.refresh)}</button>
 		</div>
-		${metaLine ? `<div class="cps-meta">${metaLine}</div>` : ""}
-		${renderPriceLine(price, d)}
+		${renderMetaLine(state, d)}
+		${ok ? renderNotice(state, d) : ""}
 		${body}`;
 }
 
@@ -811,13 +827,21 @@ const runtime = {
 	langObserver: null,
 	offLocale: null,
 	lang: "zh",
+	busy: false,
 	state: {
 		window: "today",
-		client: "all",
-		groupBy: "model",
+		bucket: "hour",
+		model: "",
+		status: "all",
+		page: 1,
+		pageSize: PAGE_SIZE,
 		summary: null,
-		hours: null,
-		events: null,
+		models: null,
+		series: null,
+		records: null,
+		pages: 1,
+		total: 0,
+		meta: null,
 		error: null,
 		loading: false,
 		expandedId: null,
@@ -830,7 +854,7 @@ function paint() {
 	runtime.root.innerHTML = renderDashboard(runtime.state, d);
 }
 
-/** 拉取三路数据（并行 + 可中断）；失败只写 state.error，绝不抛错。 */
+/** 拉取四路数据（并行 + 可中断）；失败只写 state.error，绝不抛错。 */
 async function load() {
 	if (runtime.inflight) {
 		try {
@@ -843,12 +867,17 @@ async function load() {
 	runtime.inflight = controller;
 	runtime.state.loading = true;
 	paint();
-	const qs =
-		`window=${encodeURIComponent(runtime.state.window)}` +
-		`&client=${encodeURIComponent(runtime.state.client)}` +
-		`&groupBy=${encodeURIComponent(runtime.state.groupBy)}`;
+	const st = runtime.state;
+	const common =
+		`window=${encodeURIComponent(st.window)}` +
+		`&model=${encodeURIComponent(st.model)}` +
+		`&bucket=${encodeURIComponent(st.bucket)}`;
+	const recordsQs =
+		`${common}&status=${encodeURIComponent(st.status)}` +
+		`&page=${encodeURIComponent(String(st.page))}` +
+		`&pageSize=${encodeURIComponent(String(st.pageSize))}`;
 	const base = apiBase();
-	const get = async (path) => {
+	const get = async (path, qs) => {
 		const res = await fetch(`${base}${path}?${qs}`, {
 			signal: controller.signal,
 			headers: { Accept: "application/json" },
@@ -857,12 +886,21 @@ async function load() {
 		return res.json();
 	};
 	try {
-		const [summary, series, events] = await Promise.all([get("/api/summary"), get("/api/series"), get("/api/events")]);
+		const [summary, series, records, meta] = await Promise.all([
+			get("/api/summary", common),
+			get("/api/series", common),
+			get("/api/records", recordsQs),
+			get("/api/meta", ""),
+		]);
 		if (controller.signal.aborted) return;
-		runtime.state.summary = summary;
-		runtime.state.hours = series?.ok ? series.hours : null;
-		runtime.state.events = events?.ok ? events.events : null;
-		runtime.state.error = summary?.ok ? null : summary;
+		runtime.state.summary = summary?.ok ? summary.summary : null;
+		runtime.state.models = summary?.ok ? (summary.models ?? []) : [];
+		runtime.state.series = series?.ok ? (series.series ?? []) : [];
+		runtime.state.records = records?.ok ? (records.records ?? []) : [];
+		runtime.state.pages = records?.pages ?? 1;
+		runtime.state.total = records?.total ?? 0;
+		runtime.state.meta = meta?.ok ? meta.meta : (summary?.meta ?? null);
+		runtime.state.error = summary?.ok ? null : (summary ?? { code: "unknown", reason: "统计接口没有返回" });
 	} catch (err) {
 		if (controller.signal.aborted) return;
 		// 网络/路由错误也走空态，不刷 console 噪声
@@ -870,15 +908,32 @@ async function load() {
 			code: "request-failed",
 			reason: `无法读取统计接口：${err?.message ?? err}`,
 			reasonEn: `Cannot reach the stats API: ${err?.message ?? err}`,
-			meta: runtime.state.summary?.meta,
+			hint: "",
+			candidates: [],
 		};
 	} finally {
-		if (!controller.signal.aborted) {
+		// 只有「当前请求」能复位 loading：被新请求接管或卸载时不能把标志留在 true
+		if (runtime.inflight === controller) {
 			runtime.state.loading = false;
 			runtime.inflight = null;
 			paint();
 		}
 	}
+}
+
+/** POST 动作（回填 / 授权）：有副作用不走 GET；失败只提示，不抛错。 */
+async function postAction(path) {
+	if (runtime.busy) return;
+	runtime.busy = true;
+	try {
+		await fetch(`${apiBase()}${path}`, { method: "POST", headers: { Accept: "application/json" } });
+	} catch {
+		/* 静默：紧接着的 load() 会把状态显示出来 */
+	} finally {
+		runtime.busy = false;
+	}
+	runtime.state.page = 1;
+	void load();
 }
 
 function onRootClick(event) {
@@ -887,43 +942,54 @@ function onRootClick(event) {
 	const actNode = target.closest("[data-act]");
 	if (actNode) {
 		const act = actNode.getAttribute("data-act");
+		const value = actNode.getAttribute("data-value") ?? "";
 		if (act === "refresh") {
 			void load();
 			return;
 		}
-		if (act === "prices") {
-			void refreshPrices();
+		if (act === "backfill") {
+			void postAction("/api/backfill");
 			return;
 		}
-		if (act === "window" || act === "client" || act === "groupBy") {
-			const value = actNode.getAttribute("data-value") ?? "";
-			if (!value) return;
-			if (runtime.state[act] === value) return;
+		if (act === "grant") {
+			void postAction("/api/grant");
+			return;
+		}
+		if (act === "clearModel") {
+			runtime.state.model = "";
+			runtime.state.page = 1;
+			void load();
+			return;
+		}
+		if (act === "window" || act === "bucket" || act === "status") {
+			if (!value || runtime.state[act] === value) return;
 			runtime.state[act] = value;
+			runtime.state.page = 1;
+			void load();
+			return;
+		}
+		if (act === "page") {
+			const next = Number(value);
+			if (!Number.isFinite(next) || next === runtime.state.page) return;
+			runtime.state.page = Math.max(1, Math.min(runtime.state.pages || 1, Math.trunc(next)));
 			void load();
 			return;
 		}
 	}
+	const modelRow = target.closest("tr[data-model]");
+	if (modelRow) {
+		const model = modelRow.getAttribute("data-model") ?? "";
+		runtime.state.model = runtime.state.model === model ? "" : model;
+		runtime.state.page = 1;
+		void load();
+		return;
+	}
 	const row = target.closest("tr[data-rid]");
 	if (row) {
-		const id = Number(row.getAttribute("data-rid"));
+		const id = row.getAttribute("data-rid") ?? "";
 		runtime.state.expandedId = runtime.state.expandedId === id ? null : id;
 		paint();
 	}
-}
-
-/** 手动刷新价目表（POST；有副作用，不走 GET）。失败只置错误文案，不刷 console。 */
-async function refreshPrices() {
-	try {
-		const res = await fetch(`${apiBase()}/api/prices/refresh`, {
-			method: "POST",
-			headers: { Accept: "application/json" },
-		});
-		if (!res.ok) throw new Error(`HTTP ${res.status}`);
-	} catch {
-		/* 静默：状态行会显示「刷新失败」 */
-	}
-	void load();
 }
 
 function startTimer() {
@@ -996,6 +1062,16 @@ function mount(container) {
 	if (!container) return () => {};
 	ensureStyles();
 	runtime.container = container;
+	// 新挂载 = 新视图：瞬时状态与上一轮数据一律清掉（否则会沿用旧看板的
+	// loading/展开行/数据，甚至把按钮永久 disabled）
+	runtime.state.loading = false;
+	runtime.state.error = null;
+	runtime.state.expandedId = null;
+	runtime.state.summary = null;
+	runtime.state.models = null;
+	runtime.state.series = null;
+	runtime.state.records = null;
+	runtime.state.meta = null;
 	runtime.state.lang = detectLang();
 	runtime.root = document.createElement("div");
 	runtime.root.className = "cps-root";
@@ -1025,6 +1101,7 @@ function mount(container) {
 			/* ignore */
 		}
 		runtime.inflight = null;
+		runtime.state.loading = false;
 		try {
 			runtime.offLocale?.();
 		} catch {

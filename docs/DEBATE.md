@@ -1,3 +1,7 @@
+> **v1 归档（2026-10 记录，勿按此实现）**：本文件写的是 1.0.0 的设计——读本机代理的 SQLite 账本、
+> 三源价目表与估算成本。2.0.0 已整体删除那套实现，改为记录 pi-web-ui 自己的模型调用
+> （实时事件拿 TTFT + 会话 JSONL 拿 token/真实成本）。现行口径见根目录 `README.md` 与 `CHANGELOG.md`。
+
 > **读法提示**：本文件是插件还在 pi-web-ui 主仓库（`plugins/cliproxy-stats/`）时的开发史记录。
 > 现已抽成独立仓库：文中路径 `plugins/cliproxy-stats/xxx` 现在就是本仓库根的 `xxx`，宿主仓库路径（`tests/unit/`、`plugin-sdk/`、`plugins/catalog.json`）已不再适用。
 

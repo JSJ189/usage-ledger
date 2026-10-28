@@ -3,8 +3,8 @@
 	"name": "用量账本",
 	"source": "JSJ189/usage-ledger",
 	"author": "JSJ189",
-	"description": "只读聚合本机代理的 SQLite 用量账本：请求数、成功率、TTFT 分布、时延、输出速率、token 用量与路由分布，并给出带来源与快照时间的估算成本；底栏显示今日请求数，点击打开看板。支持 EasyCLIProxyAPI 与任意兼容 usage_events schema 的账本。",
-	"descriptionEn": "Read-only aggregation of the local SQLite usage ledger: requests, success rate, TTFT, latency, throughput, tokens and per-route cost, with estimated cost labelled by source and snapshot time. Works with EasyCLIProxyAPI and any ledger with a compatible usage_events schema.",
+	"description": "记录 pi-web-ui 自己的每一次模型调用：按模型统计调用数、成功率、TTFT 分位、单次耗时、输出速率、token 用量与 SDK 记录的真实成本。数据来自运行轨迹事件（实时 TTFT）与本机会话 JSONL（token / 成本 / 耗时，可回填历史），不依赖任何第三方统计服务。底栏显示今日调用数与 TTFT p50，点击打开看板。",
+	"descriptionEn": "Records pi-web-ui's own model calls: per-model calls, success rate, TTFT percentiles, latency, throughput, tokens and the SDK-reported real cost. Data comes from run-trace events (live TTFT) and local session JSONL files (backfillable). The bottom bar shows today's calls and TTFT p50.",
 	"homepage": "https://github.com/JSJ189/usage-ledger",
 	"icon": "📊",
 	"tags": [

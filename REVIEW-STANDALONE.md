@@ -1,3 +1,7 @@
+> **v1 归档（2026-10 记录，勿按此实现）**：本文件写的是 1.0.0 的设计——读本机代理的 SQLite 账本、
+> 三源价目表与估算成本。2.0.0 已整体删除那套实现，改为记录 pi-web-ui 自己的模型调用
+> （实时事件拿 TTFT + 会话 JSONL 拿 token/真实成本）。现行口径见根目录 `README.md` 与 `CHANGELOG.md`。
+
 # REVIEW-STANDALONE · cliproxy-stats 上线前独立复核
 
 判定：**FAIL（P0 = 0，P1 = 2，P2 = 5）**

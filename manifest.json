@@ -2,55 +2,39 @@
 	"id": "usage-ledger",
 	"name": "用量账本",
 	"nameEn": "Usage Ledger",
-	"version": "1.0.0",
+	"version": "2.0.0",
 	"author": "JSJ189",
 	"homepage": "https://github.com/JSJ189/usage-ledger",
 	"license": "MIT",
 	"icon": "📊",
 	"iconSvg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M3 3v18h18\"/><rect x=\"7\" y=\"12\" width=\"3\" height=\"6\"/><rect x=\"12\" y=\"8\" width=\"3\" height=\"10\"/><rect x=\"17\" y=\"5\" width=\"3\" height=\"13\"/></svg>",
-	"description": "读取本机代理的 SQLite 用量账本（只读），统计请求数、成功率、TTFT 分布、时延、输出速率、token 用量与路由分布，并给出带来源与快照时间的估算成本；底栏显示今日请求数，点击进入看板。支持 EasyCLIProxyAPI 以及任意兼容 usage_events schema 的账本，账本位置可设置项、环境变量或自动发现。",
-	"descriptionEn": "Reads the local proxy's SQLite usage ledger (read-only) and reports request counts, success rate, TTFT distribution, latency, output throughput, token usage and per-route breakdown, with estimated cost labelled by source and snapshot time; the bottom bar shows today's request count, click for the dashboard. Works with EasyCLIProxyAPI and any ledger exposing a compatible usage_events schema; the ledger path can come from settings, an environment variable, or auto-discovery.",
+	"description": "记录 pi-web-ui 自己的每一次模型调用：按模型统计调用数、成功率、TTFT 分位、单次耗时、输出速率、token 用量与 SDK 记录的真实成本。数据来自运行轨迹事件（实时 TTFT）与本机会话 JSONL（token / 成本 / 耗时，可回填历史），不读任何代理账本、不抓价目表、不估算金额。底栏显示今日调用数与 TTFT p50，点击打开看板。",
+	"descriptionEn": "Records pi-web-ui's own model calls: per-model call counts, success rate, TTFT percentiles, latency, throughput, token usage and the real cost reported by the SDK. Data comes from run-trace events (live TTFT) plus local session JSONL files (tokens / cost / duration, backfillable), with no proxy ledger, no price tables and no estimated amounts. The bottom bar shows today's call count and TTFT p50; click for the dashboard.",
 	"apiVersion": 2,
 	"view": false,
 	"preload": true,
-	"permissions": ["ui", "http", "net", "storage"],
+	"permissions": ["ui", "storage", "http", "fs:read"],
 	"settings": [
 		{
-			"key": "dbPath",
+			"key": "sessionsDir",
 			"type": "text",
-			"label": "账本路径 (Ledger DB path)",
+			"label": "会话目录 (Sessions directory)",
 			"default": "",
-			"hint": "usage.db 的绝对路径，须以 .db 结尾。留空 = 按发现链自动找（环境变量 CLIPROXY_USAGE_DB → pi 代理配置的端口 → 已知安装位置 → 搜索根）。插件只读打开，永不写入。"
+			"hint": "pi 会话 JSONL 所在目录的绝对路径，用于回填历史 token / 成本 / 耗时。留空 = 自动：$PI_CODING_AGENT_DIR/sessions → ~/.pi/agent/sessions。插件只读该目录，绝不写入。"
 		},
 		{
-			"key": "autoDiscover",
+			"key": "backfillDays",
+			"type": "text",
+			"label": "回填天数 (Backfill days)",
+			"default": "30",
+			"hint": "只回填修改时间在最近 N 天内的会话文件（默认 30，夹取 1–3650）。改大可以导入更早的历史，代价是首次回填更久。"
+		},
+		{
+			"key": "backfillOnStart",
 			"type": "boolean",
-			"label": "自动发现账本 (Auto-discover ledger)",
+			"label": "启动时回填 (Backfill on start)",
 			"default": true,
-			"hint": "关闭后只认 dbPath 与环境变量 CLIPROXY_USAGE_DB，不扫盘、不读代理配置。多实例或想固定账本时关掉更可预测。"
-		},
-		{
-			"key": "searchRoots",
-			"type": "text",
-			"label": "自动发现根目录 (Discovery roots)",
-			"default": "",
-			"hint": "可选。自动发现时扫描的根目录，多个用英文分号分隔，如 D:\\;E:\\。留空 = Windows 扫所有存在的盘符根（只 readdir 两层），其它系统扫 ~/.local/share、家目录、/opt、/usr/local。"
-		},
-		{
-			"key": "cacheTtlSec",
-			"type": "number",
-			"label": "缓存与预热间隔（秒，Cache TTL sec）",
-			"default": 60,
-			"min": 10,
-			"max": 3600,
-			"hint": "聚合结果缓存时长，同时作为 host.schedule 预热间隔。夹取 10–3600 秒。"
-		},
-		{
-			"key": "priceOverrides",
-			"type": "text",
-			"label": "价格覆盖 (Price overrides, JSON)",
-			"default": "",
-			"hint": "可选。USD / 1M tokens，形如 {\"grok-4.7\": {\"input\": 2, \"output\": 6, \"cacheRead\": 0.5}}。只存在插件自己的配置里，绝不写账本；非法 JSON 会被忽略并标记。"
+			"hint": "插件激活时立刻跑一次增量回填；关掉后只在每 5 分钟的定时任务或点看板「回填」时跑。"
 		}
 	],
 	"ui": {
@@ -66,8 +50,8 @@
 				"align": "start",
 				"order": 17,
 				"badge": "--",
-				"hint": "📊 用量账本：今日请求数 / TTFT p50（点击打开看板）",
-				"hintEn": "📊 Usage Ledger: today's requests / TTFT p50 (click to open the dashboard)"
+				"hint": "📊 用量账本：今日调用数 / TTFT p50（没有 fs:read 时显示「仅实时」；点击打开看板）",
+				"hintEn": "📊 Usage Ledger: today's calls / TTFT p50 (shows \"live only\" without fs:read; click to open the dashboard)"
 			}
 		],
 		"topbar.primary": [
@@ -81,10 +65,9 @@
 				"view": "plugin:usage-ledger",
 				"align": "end",
 				"order": 24,
-				"hint": "打开用量账本看板（代理用量账本只读聚合）",
-				"hintEn": "Open the Usage Ledger dashboard (read-only aggregation of the proxy usage ledger)"
+				"hint": "打开用量账本看板（pi-web-ui 自己的模型调用记录）",
+				"hintEn": "Open the Usage Ledger dashboard (pi-web-ui's own model calls)"
 			}
 		]
-	},
-	"netAllowlist": ["models.dev", "raw.githubusercontent.com", "openrouter.ai"]
+	}
 }

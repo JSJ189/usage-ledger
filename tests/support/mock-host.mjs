@@ -39,6 +39,8 @@ export function createMockHost(overrides = {}) {
 	const effectStore = [];
 	const bgTaskStore = [];
 	const uiItems = new Map();
+	/** 所有 ui.update 调用（真宿主的条目来自 manifest 声明，mock 没注册也能断言）。 */
+	const uiUpdates = [];
 
 	const handlersOf = (method) => {
 		let arr = handlerMap.get(method);
@@ -127,6 +129,10 @@ export function createMockHost(overrides = {}) {
 			},
 			all: () => Object.fromEntries(storeMap),
 		},
+		// ── 跨目录 fs：默认空白（= 插件没有 fs:read/未授权），单测用 overrides.fs 注入
+		fs: {},
+		// ── 插件数据目录（宿主给 <dataDir>/<pluginId>；单测必须注入临时目录）
+		dataDir: "",
 		getSettings: () => settingsState,
 		// ── UI（内存注册表：同 id 覆盖；off 只摘本次注册的 id）
 		ui: {
@@ -146,7 +152,9 @@ export function createMockHost(overrides = {}) {
 				};
 			},
 			update: (id, patch) => {
-				if (!uiItems.has(id) || !isPlainObject(patch)) return;
+				if (!isPlainObject(patch)) return;
+				uiUpdates.push({ id: String(id), patch: { ...patch } });
+				if (!uiItems.has(id)) return;
 				uiItems.set(id, { ...uiItems.get(id), ...patch, id });
 			},
 			remove: (id) => {
@@ -208,6 +216,15 @@ export function createMockHost(overrides = {}) {
 			},
 			get uiItems() {
 				return [...uiItems.values()];
+			},
+			/** 最近的 ui.update 调用（按序；最后一个就是当前徽标状态）。 */
+			get uiUpdates() {
+				return [...uiUpdates];
+			},
+			/** 某个条目最后一次 update 的 patch（合并后的视图）。 */
+			lastUiUpdate: (id) => {
+				const hits = uiUpdates.filter((u) => u.id === id);
+				return hits.length ? { ...hits[hits.length - 1].patch } : null;
 			},
 			/** 依次触发已登记的定时回调（返回各回调返回值；抛错即 reject）。 */
 			fireSchedules: () => Promise.all(scheduleStore.map((s) => s.fn())),
