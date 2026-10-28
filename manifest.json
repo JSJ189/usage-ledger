@@ -2,7 +2,7 @@
 	"id": "usage-ledger",
 	"name": "用量账本",
 	"nameEn": "Usage Ledger",
-	"version": "2.0.2",
+	"version": "2.0.3",
 	"author": "JSJ189",
 	"homepage": "https://github.com/JSJ189/usage-ledger",
 	"license": "MIT",
@@ -13,7 +13,7 @@
 	"apiVersion": 2,
 	"view": false,
 	"preload": true,
-	"permissions": ["ui", "storage", "http", "fs:read"],
+	"permissions": ["ui", "http", "fs:read"],
 	"settings": [
 		{
 			"key": "sessionsDir",

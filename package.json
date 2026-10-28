@@ -1,6 +1,6 @@
 {
   "name": "pi-web-ui-plugin-usage-ledger",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "private": false,
   "description": "pi-web-ui 界面插件：记录 pi-web-ui 自己的每次模型调用（按模型统计 TTFT / 延迟 / token / 真实成本）",
   "license": "MIT",

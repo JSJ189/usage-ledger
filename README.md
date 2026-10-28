@@ -31,7 +31,7 @@ pi-web-ui install JSJ189/usage-ledger
 
 ## 权限说明（重要）
 
-`manifest.permissions = ["ui", "storage", "http", "fs:read"]`。
+`manifest.permissions = ["ui", "http", "fs:read"]`。
 
 - `fs:read`：读 `~/.pi/agent/sessions/**/*.jsonl`，这是**唯一**能拿到逐轮 token 与真实成本的地方（宿主的 `UiMessage` 不带 token）。它会让 registry 风险等级从 LOW 升到 **MEDIUM，安装时需人工确认**——这是拿到 token 数据的必要代价。插件对该目录**只读**，绝不写入；路径可用设置项 `sessionsDir` 覆盖，首次访问由宿主弹窗授权（`host.fs.requestAccess`）。
 - `http`：插件自己的看板数据路由（`host.route("/api/…")`）。**没有网络请求**：不抓价目表、不访问任何外部主机，`netAllowlist` 已删除。
