@@ -120,6 +120,12 @@ const ZH = {
 	next: "下一页",
 	total: "共",
 	rows: "条",
+	colSettings: "显示设置",
+	exportCsv: "导出筛选结果 CSV",
+	exportHint: "导出当前筛选条件（模型 / 状态 / 时间窗口）下的记录，上限 5000 行",
+	exportDone: (n) => `已导出 ${n} 行`,
+	exportCapped: "已达 5000 行上限，请缩小筛选范围后再导出",
+	rowsPerPage: " 条/页",
 	ledger: "账本",
 	sessionsRoot: "会话目录",
 	lastBackfill: "上次回填",
@@ -221,6 +227,12 @@ const EN = {
 	next: "Next",
 	total: "Total",
 	rows: "rows",
+	colSettings: "Columns",
+	exportCsv: "Export filtered CSV",
+	exportHint: "Export records under the current filter (model / status / window), capped at 5000 rows",
+	exportDone: (n) => `Exported ${n} rows`,
+	exportCapped: "Hit the 5000-row cap; narrow the filter before exporting",
+	rowsPerPage: " / page",
 	ledger: "Ledger",
 	sessionsRoot: "Sessions",
 	lastBackfill: "Last backfill",
@@ -414,6 +426,31 @@ function ensureStyles() {
 		.cps-badge.bad { background: color-mix(in srgb, var(--red, #ef4444) 22%, transparent); color: var(--red, #ef4444); }
 		.cps-badge.cancel { background: color-mix(in srgb, var(--amber, #f59e0b) 22%, transparent); color: var(--amber, #f59e0b); }
 		.cps-badge.multi { background: color-mix(in srgb, var(--amber, #f59e0b) 14%, transparent); color: var(--amber, #f59e0b); font-weight: 500; margin-left: 5px; }
+		.cps-tools {
+			display: flex;
+			flex-wrap: wrap;
+			gap: 6px 14px;
+			padding: 8px 10px;
+			margin-top: 6px;
+			border: 1px solid var(--border, #2a2e3a);
+			border-radius: 8px;
+			font-size: 12px;
+		}
+		.cps-col {
+			display: inline-flex;
+			align-items: center;
+			gap: 4px;
+			color: var(--text-dim, #8b90a0);
+			cursor: pointer;
+		}
+		.cps-sel {
+			background: transparent;
+			color: inherit;
+			border: 1px solid var(--border, #2a2e3a);
+			border-radius: 6px;
+			font-size: 12px;
+			padding: 2px 4px;
+		}
 		.cps-notice {
 			border: 1px solid color-mix(in srgb, var(--amber, #f59e0b) 45%, transparent);
 			background: color-mix(in srgb, var(--amber, #f59e0b) 12%, transparent);
@@ -651,7 +688,65 @@ function sourceLabel(record, d) {
 	return sources[0] === "live" ? d.sourceLive : d.sourceBackfill;
 }
 
-/** 记录明细表（分页 + 点开明细）。 */
+/** 记录明细表（分页 + 列开关 + CSV 导出 + 点开明细）。 */
+const ALL_COLS = ["time", "model", "provider", "thinking", "tokens", "cache", "ttft", "duration", "tokps", "cost", "status"];
+
+/** 读列开关偏好（locolStorage；禁用/损坏时全部显示）。 */
+function readHiddenCols() {
+	try {
+		const raw = window.localStorage.getItem("cps:hiddenCols");
+		if (!raw) return [];
+		const list = JSON.parse(raw);
+		return Array.isArray(list) ? list.filter((c) => ALL_COLS.includes(c)) : [];
+	} catch {
+		return [];
+	}
+}
+
+function writeHiddenCols(list) {
+	try {
+		window.localStorage.setItem("cps:hiddenCols", JSON.stringify(list));
+	} catch {
+		/* 隐私模式禁 localStorage：不记忆，不影响功能 */
+	}
+}
+
+function colVisible(state, col) {
+	const hidden = Array.isArray(state.hiddenCols) ? state.hiddenCols : [];
+	return !hidden.includes(col);
+}
+
+/** 组装 CSV 文本（带 BOM，Excel 中文不乱码）。
+ *  纯函数：给定行数据与列清单返回字符串，单测可直接断言。 */
+export function buildCsv(rows, d) {
+	const head = [d.thTime, d.thModel, d.thProvider, d.thThinking, d.thTokens, d.thCache, d.thTtft, d.thDuration, d.thTokps, d.thCost, d.thStatus];
+	const cells = (r) => {
+		const tokps =
+			Number(r.outputTokens) > 0 && Number(r.durationMs) > 0 ? Number(r.outputTokens) / (Number(r.durationMs) / 1000) : null;
+		const status = r.status === "error" ? d.statusFailed : r.status === "incomplete" ? d.statusIncomplete : d.statusOk;
+		return [
+			new Date(Number(r.ts) || 0).toISOString(),
+			r.model ?? "",
+			r.provider ?? "",
+			r.thinkingLevel ?? "",
+			String(Number(r.totalTokens ?? 0)),
+			`${Number(r.cacheReadTokens ?? 0)}/${Number(r.cacheWriteTokens ?? 0)}`,
+			r.ttftMs === null || r.ttftMs === undefined ? "" : String(Number(r.ttftMs)),
+			r.durationMs === null || r.durationMs === undefined ? "" : String(Number(r.durationMs)),
+			tokps === null ? "" : tokps.toFixed(2),
+			r.costUsd === null || r.costUsd === undefined ? "" : Number(r.costUsd).toFixed(6),
+			status,
+		];
+	};
+	const esc = (v) => {
+		const s = String(v ?? "");
+		return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+	};
+	const lines = [head.map(esc).join(",")];
+	for (const r of rows ?? []) lines.push(cells(r).map(esc).join(","));
+	return `\uFEFF${lines.join("\r\n")}\r\n`;
+}
+
 function renderRecords(state, d) {
 	const list = Array.isArray(state.records) ? state.records : [];
 	if (!list.length) return `<div class="cps-empty">${esc(state.summary?.calls ? d.emptyWindow : d.empty)}</div>`;
@@ -661,20 +756,21 @@ function renderRecords(state, d) {
 			const rid = esc(r.id);
 			const tokps = Number(r.outputTokens) > 0 && Number(r.durationMs) > 0 ? Number(r.outputTokens) / (Number(r.durationMs) / 1000) : null;
 			const main = `<tr data-rid="${rid}">
-				<td class="mono">${esc(fmtTime(r.ts))}</td>
-				<td>${esc(r.model ?? d.unknown)}</td>
-				<td class="cps-c-dim">${esc(r.provider ?? "--")}</td>
-				<td class="cps-c-dim">${esc(r.thinkingLevel ?? "--")}</td>
-				<td class="mono">${esc(fmtInt(r.totalTokens ?? 0))}</td>
-				<td class="mono cps-c-dim">${esc(`${fmtInt(r.cacheReadTokens ?? 0)}/${fmtInt(r.cacheWriteTokens ?? 0)}`)}</td>
-				<td class="mono">${esc(r.ttftMs === null || r.ttftMs === undefined ? "--" : fmtMs(r.ttftMs))}</td>
-				<td class="mono">${esc(r.durationMs === null || r.durationMs === undefined ? "--" : fmtMs(r.durationMs))}</td>
-				<td class="mono">${esc(fmtTokps(tokps))}</td>
-				<td class="mono">${esc(fmtCost(r.costUsd))}</td>
-				<td>${statusBadge(r.status, d)}</td>
+				${colVisible(state, "time") ? `<td class="mono">${esc(fmtTime(r.ts))}</td>` : ""}
+				${colVisible(state, "model") ? `<td>${esc(r.model ?? d.unknown)}</td>` : ""}
+				${colVisible(state, "provider") ? `<td class="cps-c-dim">${esc(r.provider ?? "--")}</td>` : ""}
+				${colVisible(state, "thinking") ? `<td class="cps-c-dim">${esc(r.thinkingLevel ?? "--")}</td>` : ""}
+				${colVisible(state, "tokens") ? `<td class="mono">${esc(fmtInt(r.totalTokens ?? 0))}</td>` : ""}
+				${colVisible(state, "cache") ? `<td class="mono cps-c-dim">${esc(`${fmtInt(r.cacheReadTokens ?? 0)}/${fmtInt(r.cacheWriteTokens ?? 0)}`)}</td>` : ""}
+				${colVisible(state, "ttft") ? `<td class="mono">${esc(r.ttftMs === null || r.ttftMs === undefined ? "--" : fmtMs(r.ttftMs))}</td>` : ""}
+				${colVisible(state, "duration") ? `<td class="mono">${esc(r.durationMs === null || r.durationMs === undefined ? "--" : fmtMs(r.durationMs))}</td>` : ""}
+				${colVisible(state, "tokps") ? `<td class="mono">${esc(fmtTokps(tokps))}</td>` : ""}
+				${colVisible(state, "cost") ? `<td class="mono">${esc(fmtCost(r.costUsd))}</td>` : ""}
+				${colVisible(state, "status") ? `<td>${statusBadge(r.status, d)}</td>` : ""}
 			</tr>`;
 			if (!open) return main;
-			const detail = `<tr class="cps-detail"><td colspan="11">
+			const span = ALL_COLS.filter((c) => colVisible(state, c)).length || 1;
+			const detail = `<tr class="cps-detail"><td colspan="${span}">
 				${esc(d.thDetail)}：<b>${esc(d.kvIn)}</b> ${esc(fmtInt(r.inputTokens ?? 0))} ·
 				<b>${esc(d.kvOut)}</b> ${esc(fmtInt(r.outputTokens ?? 0))} ·
 				<b>${esc(d.kvCacheRead)}</b> ${esc(fmtInt(r.cacheReadTokens ?? 0))} ·
@@ -690,19 +786,43 @@ function renderRecords(state, d) {
 		.join("");
 	const pages = Math.max(1, Number(state.pages) || 1);
 	const page = Math.min(pages, Math.max(1, Number(state.page) || 1));
+	const head = `<tr>
+		${colVisible(state, "time") ? `<th>${esc(d.thTime)}</th>` : ""}
+		${colVisible(state, "model") ? `<th>${esc(d.thModel)}</th>` : ""}
+		${colVisible(state, "provider") ? `<th>${esc(d.thProvider)}</th>` : ""}
+		${colVisible(state, "thinking") ? `<th>${esc(d.thThinking)}</th>` : ""}
+		${colVisible(state, "tokens") ? `<th>${esc(d.thTokens)}</th>` : ""}
+		${colVisible(state, "cache") ? `<th>${esc(d.thCache)}</th>` : ""}
+		${colVisible(state, "ttft") ? `<th>${esc(d.thTtft)}</th>` : ""}
+		${colVisible(state, "duration") ? `<th>${esc(d.thDuration)}</th>` : ""}
+		${colVisible(state, "tokps") ? `<th>${esc(d.thTokps)}</th>` : ""}
+		${colVisible(state, "cost") ? `<th>${esc(d.thCost)}</th>` : ""}
+		${colVisible(state, "status") ? `<th>${esc(d.thStatus)}</th>` : ""}
+	</tr>`;
+	const colToggle = state.showColSettings
+		? `<div class="cps-tools">${ALL_COLS.map((c) => {
+				const label = {
+					time: d.thTime, model: d.thModel, provider: d.thProvider, thinking: d.thThinking,
+					tokens: d.thTokens, cache: d.thCache, ttft: d.thTtft, duration: d.thDuration,
+					tokps: d.thTokps, cost: d.thCost, status: d.thStatus,
+				}[c];
+				return `<label class="cps-col"><input type="checkbox" data-act="col" data-value="${c}" ${colVisible(state, c) ? "checked" : ""}/> ${esc(label)}</label>`;
+			}).join("")}</div>`
+		: "";
 	const pager = `<div class="cps-pager">
 		<span>${esc(d.total)} ${esc(fmtInt(state.total ?? list.length))} ${esc(d.rows)} · ${esc(d.page(page, pages))}</span>
+		<button class="cps-btn" data-act="toggleCols">${esc(d.colSettings)}</button>
+		<button class="cps-btn" data-act="exportCsv" title="${esc(d.exportHint)}">${esc(d.exportCsv)}</button>
+		<select class="cps-sel" data-act="pageSize">${[20, 50, 100, 200]
+			.map((n) => `<option value="${n}" ${n === Number(state.pageSize) ? "selected" : ""}>${n}${esc(d.rowsPerPage)}</option>`)
+			.join("")}</select>
 		<button class="cps-btn" data-act="page" data-value="${page - 1}" ${page <= 1 ? "disabled" : ""}>${esc(d.prev)}</button>
 		<button class="cps-btn" data-act="page" data-value="${page + 1}" ${page >= pages ? "disabled" : ""}>${esc(d.next)}</button>
 	</div>`;
 	return `<div class="cps-tbl-wrap"><table class="cps-tbl cps-records">
-		<thead><tr>
-			<th>${esc(d.thTime)}</th><th>${esc(d.thModel)}</th><th>${esc(d.thProvider)}</th><th>${esc(d.thThinking)}</th>
-			<th>${esc(d.thTokens)}</th><th>${esc(d.thCache)}</th><th>${esc(d.thTtft)}</th><th>${esc(d.thDuration)}</th>
-			<th>${esc(d.thTokps)}</th><th>${esc(d.thCost)}</th><th>${esc(d.thStatus)}</th>
-		</tr></thead>
+		<thead>${head}</thead>
 		<tbody>${rows}</tbody>
-	</table></div>${pager}`;
+	</table></div>${colToggle}${pager}`;
 }
 
 /** 顶部降级/授权提示（只在需要时出现）。 */
@@ -830,6 +950,7 @@ function renderDashboard(state, d) {
 		</div>
 		${renderMetaLine(state, d)}
 		${ok ? renderNotice(state, d) : ""}
+		${state.notice ? `<div class="cps-notice">${esc(state.notice)}</div>` : ""}
 		${body}`;
 }
 
@@ -862,6 +983,9 @@ const runtime = {
 		error: null,
 		loading: false,
 		expandedId: null,
+		hiddenCols: readHiddenCols(),
+		showColSettings: false,
+		notice: "",
 	},
 };
 
@@ -953,6 +1077,80 @@ async function postAction(path) {
 	void load();
 }
 
+/** 导出当前筛选下的记录（分页拉完，上限 5000 行）。失败只改 notice，不抛错。 */
+async function exportCsv() {
+	const d = dict(runtime.state.lang);
+	const st = runtime.state;
+	const MAX_ROWS = 5000;
+	const PAGE = 200;
+	const base = apiBase();
+	const rows = [];
+	let page = 1;
+	let capped = false;
+	try {
+		while (rows.length < MAX_ROWS) {
+			const qs =
+				`window=${encodeURIComponent(st.window)}` +
+				`&model=${encodeURIComponent(st.model)}` +
+				`&status=${encodeURIComponent(st.status)}` +
+				`&page=${page}` +
+				`&pageSize=${PAGE}`;
+			const res = await fetch(`${base}/api/records?${qs}`, { headers: { Accept: "application/json" } });
+			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			const data = await res.json();
+			const list = data?.ok ? (data.records ?? []) : [];
+			rows.push(...list);
+			const pages = Number(data?.pages) || 1;
+			if (page >= pages || !list.length) break;
+			page++;
+		}
+	} catch (err) {
+		st.notice = `导出失败：${err?.message ?? err}`;
+		paint();
+		return;
+	}
+	if (rows.length > MAX_ROWS) {
+		rows.length = MAX_ROWS;
+		capped = true;
+	}
+	if (!rows.length) {
+		st.notice = d.emptyWindow;
+		paint();
+		return;
+	}
+	try {
+		const csv = buildCsv(rows, d);
+		const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement("a");
+		a.href = url;
+		a.download = `usage-ledger-${st.window}${st.model ? `-${st.model}` : ""}.csv`;
+		document.body.appendChild(a);
+		a.click();
+		a.remove();
+		setTimeout(() => URL.revokeObjectURL(url), 1000);
+	} catch (err) {
+		st.notice = `导出失败：${err?.message ?? err}`;
+		paint();
+		return;
+	}
+	st.notice = capped ? d.exportCapped : d.exportDone(rows.length);
+	paint();
+}
+
+/** 下拉（每页条数）用 change 事件，不进 click。 */
+function onRootChange(event) {
+	const target = event.target instanceof Element ? event.target : null;
+	if (!target) return;
+	const act = target.getAttribute?.("data-act");
+	if (act !== "pageSize") return;
+	const n = Number(target.value);
+	if (!Number.isFinite(n) || n <= 0) return;
+	runtime.state.pageSize = n;
+	runtime.state.page = 1;
+	void load();
+}
+
 function onRootClick(event) {
 	const target = event.target instanceof Element ? event.target : null;
 	if (!target) return;
@@ -987,6 +1185,26 @@ function onRootClick(event) {
 			runtime.state[act] = value;
 			runtime.state.page = 1;
 			void load();
+			return;
+		}
+		if (act === "toggleCols") {
+			runtime.state.showColSettings = !runtime.state.showColSettings;
+			paint();
+			return;
+		}
+		if (act === "col") {
+			const hidden = new Set(Array.isArray(runtime.state.hiddenCols) ? runtime.state.hiddenCols : []);
+			if (hidden.has(value)) hidden.delete(value);
+			else hidden.add(value);
+			// 至少留一列：全关时把「时间」强制打开，避免表格塌成一个空列
+			if (hidden.size >= ALL_COLS.length) hidden.delete("time");
+			runtime.state.hiddenCols = [...hidden];
+			writeHiddenCols(runtime.state.hiddenCols);
+			paint();
+			return;
+		}
+		if (act === "exportCsv") {
+			void exportCsv();
 			return;
 		}
 		if (act === "page") {
@@ -1097,6 +1315,7 @@ function mount(container) {
 	runtime.root = document.createElement("div");
 	runtime.root.className = "cps-root";
 	runtime.root.addEventListener("click", onRootClick);
+	runtime.root.addEventListener("change", onRootChange);
 	container.appendChild(runtime.root);
 	paint();
 	void load();
@@ -1137,6 +1356,7 @@ function mount(container) {
 		runtime.langObserver = null;
 		try {
 			runtime.root?.removeEventListener("click", onRootClick);
+			runtime.root?.removeEventListener("change", onRootChange);
 			runtime.root?.remove();
 		} catch {
 			/* ignore */
