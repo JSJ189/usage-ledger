@@ -3,16 +3,16 @@
 	"name": "用量账本",
 	"source": "JSJ189/usage-ledger",
 	"author": "JSJ189",
-	"description": "记录 pi-web-ui 自己的每一次模型调用：按模型统计调用数、成功率、TTFT 分位、单次耗时、输出速率、token 用量与 SDK 记录的真实成本。数据来自运行轨迹事件（实时 TTFT）与本机会话 JSONL（token / 成本 / 耗时，可回填历史），不依赖任何第三方统计服务。底栏显示今日调用数与 TTFT p50，点击打开看板。",
-	"descriptionEn": "Records pi-web-ui's own model calls: per-model calls, success rate, TTFT percentiles, latency, throughput, tokens and the SDK-reported real cost. Data comes from run-trace events (live TTFT) and local session JSONL files (backfillable). The bottom bar shows today's calls and TTFT p50.",
+	"description": "记录 pi-web-ui 自己的每一次模型调用：按模型统计调用数、TTFT、延迟、输出速度、token 与真实成本，可查看逐条记录、按模型筛选并导出 CSV。数据只来自本机会话与运行事件，不上传任何内容。",
+	"descriptionEn": "Records every model call made inside pi-web-ui: per-model request counts, TTFT, latency, throughput, tokens and real recorded cost, with a filterable record list and CSV export. Data comes only from local sessions and run events; nothing is uploaded.",
 	"homepage": "https://github.com/JSJ189/usage-ledger",
 	"icon": "📊",
 	"tags": [
 		"统计",
-		"代理",
 		"用量",
+		"TTFT",
+		"延迟",
 		"成本",
-		"sqlite",
 		"observability"
 	]
 }
