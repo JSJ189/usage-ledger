@@ -1,5 +1,33 @@
 # CHANGELOG
 
+## 2.1.1
+
+- `scripts/verify-real-sessions.mjs` 判定口径修正：参考值是历史快照，滚动窗口的正偏差不再判失败；只拦「少算 / 覆盖不全 / truncated」，需要旧行为加 `--strict`
+
+## 2.1.0 — 补价格表回退、缓存命中率、速度口径
+
+修三个用户可见问题：内网网关（LiteLLM / cliproxyapi 这类）不回填价格导致成本全显示 `$0.0000`；缓存字段落库了但没算命中率；`tok·s⁻¹` 是「每次调用的算术均值」而不是总体吞吐。
+
+### 新增
+
+- **价格表回退（A）**：新建 `lib/prices.mjs`。SDK 没有回填成本（`cost.total = 0`）时，按三个公开源估算：models.dev（已是每 1M）、LiteLLM（每 token ×1e6）、OpenRouter（字符串每 token ×1e6）。三源失败互不影响，失败只记 `sources[].ok=false`。
+  - 缓存：`<host.dataDir>/prices.json`，TTL 7 天；读缓存不联网；`POST /api/prices/refresh` 强制刷新；刷新失败保留旧快照。
+  - 计价口径：`promptTokens = input + cacheRead + cacheWrite`，`estimateUsd = (input*pIn + output*pOut + cacheRead*pCacheRead + cacheWrite*pCacheWrite) / 1e6`。缺 `cacheRead` / `cacheWrite` 价一律按 `input` 计，并在 `priceNote` 里标 `cacheRead≈input`；**绝不把缺价当 0**。
+  - 记录字段：`costUsd`（生效成本：SDK `>0` 优先，否则估算）、`costSource`（`sdk` / `estimate` / `null`）、`costEstimateUsd`（估算值永远保留）、`priceId`、`priceNote`。
+  - 汇总：`summary.cost = {amount, sdkAmount, estimatedAmount, estimateShare, pricedCalls, unpricedCalls, …}`，`amount = sdkAmount + estimatedAmount`；看板同时显示「其中估算」占比。
+  - 模型解析（`resolvePrice(model, hints)`，纯函数）：用户覆盖 `priceOverrides` → 官方厂商行（`qwen*`→alibaba-cn/alibaba，`gemini*`→google，`grok*`→xai，`mimo*`→xiaomi，`deepseek*`→deepseek/alibaba*；匹配前先剥 `provider/` 前缀与 `-high` / `-next` / `-1017` 这类变体后缀）→ 多来源中位数 → `null`（显示 `--`）。候选**全部可枚举**：`GET /api/prices?model=xxx`。
+- **缓存命中率（B）**：记录级 `cacheReadTokens / promptTokens`（分母 0 → `null`）。汇总主口径是加权 `ΣcacheRead / ΣpromptTokens`，另给 `cacheHitRateMean` 与 `cacheHitSamples`。展示：指标卡新增「缓存命中率」（带样本数）、按模型表新增「命中率」列、记录表缓存列改成 `读/写 · 命中%`、CSV 新增「缓存命中率」列。**没有缓存字段的老会话排除出样本，不算 0%**。
+- **速度口径（C）**：`lib/metrics.mjs` 新增 `throughput(records) → {weighted, mean, samples}`；指标卡与按模型表的 `tok·s⁻¹` 主值改成 `weighted`（总输出 ÷ 总耗时），算术均值（2.0 的旧口径）以 `tokPerSecMean` 保留，只放在 tooltip。记录表每行仍是「本条 output ÷ 耗时」，不变。
+- **看板**：新增「价格表」面板（每个模型命中的价格行、四项价、候选数、失败源、「刷新价格表」按钮，并给出 `priceOverrides` 写法）。
+- **设置项**：恢复 `priceOverrides`（JSON，USD / 每 1M token，可选）。
+- **接口**：新增 `GET /api/prices?model=`、`POST /api/prices/refresh`；`/api/meta` 与 `/api/summary` 带价格表状态。
+
+### 工程
+
+- 单测 201 → 265 条（新增：三源归一单位、候选枚举顺序、6 个已知候选命中、中位数回退、覆盖优先、缺缓存价按 input 计、SDK 优先于估算、两者都无 → `null`、命中率分母 0 → `null`、加权 vs 均值不同值、老会话排除样本、缓存读写与 TTL、刷新失败保留旧快照、插件接线与两个新接口）。
+- 测试全部离线：价格数据用 `tests/fixtures/prices/*.json`（按真实源形状裁剪），`host.fetch` 一律打桩。
+- `callsChart`（含 `yGoodTop`）与 `tests/unit/usage-ledger-chart-baseline.test.ts` 未改动；权限仍为 `["ui","http","fs:read"]`（价格抓取走 `host.fetch`，不需要 `net`）。
+
 ## 2.0.3
 
 - 权限收敛：去掉未使用的 `storage`（账本与状态都写在插件自己的数据目录），现为 `["ui","http","fs:read"]`

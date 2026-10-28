@@ -8,7 +8,8 @@
  *  3. 图标不得是 ⚡（与内置插件撞脸）；
  *  4. manifest.version 与 package.json.version 一致；
  *  5. registry/plugin.json 与 manifest 的 id / name / homepage / author 对齐，描述是中文；
- *  6. 仓库里不得残留代理账本 / 价目表的实现或数据（2.0 的数据源只有 pi 自己的调用）。
+ *  6. 仓库里不得残留代理账本的实现或数据；价格表只允许 `lib/prices.mjs` 一个模块，
+ *     且只能引用三个固定的公开价格源（2.1 的估算依据）。
  */
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -56,11 +57,11 @@ for (const p of perms) {
 	}
 }
 if (new Set(perms).size !== perms.length) fail("manifest.permissions 有重复项");
-// 2.0 的数据源不需要联网：声明 net 一定是误加
-if (perms.includes("net")) fail("2.0 不联网（成本用 SDK usage.cost.total），不得声明 net 权限");
+// 2.1 用 host.fetch 抓价格表（http 权限已覆盖），不需要 net
+if (perms.includes("net")) fail("价格抓取走 host.fetch（http 权限），不需要 net 权限");
 if (!perms.includes("fs:read")) fail("缺少 fs:read：读会话 JSONL 拿 token 需要它");
 if (!perms.includes("http")) fail("缺少 http：看板的数据路由（host.route）需要它");
-if (manifest.netAllowlist) fail("netAllowlist 已废弃（2.0 不联网），必须删掉");
+if (manifest.netAllowlist) fail("netAllowlist 已废弃（抓取走 host.fetch + 固定主机白名单），必须删掉");
 // fs:read 会提高 registry 风险等级：README 必须写清原因
 try {
 	const readme = readFileSync(join(ROOT, "README.md"), "utf8");
@@ -139,6 +140,7 @@ const REQUIRED_FILES = [
 	"lib/sessions.mjs",
 	"lib/metrics.mjs",
 	"lib/live.mjs",
+	"lib/prices.mjs",
 	"manifest.json",
 ];
 for (const rel of REQUIRED_FILES) {
@@ -148,7 +150,7 @@ for (const rel of REQUIRED_FILES) {
 		fail(`缺交付文件：${rel}`);
 	}
 }
-const REMOVED_FILES = ["lib/prices.mjs", "scripts/verify-real-db.mjs", "tests/fixtures/cliproxy-prices"];
+const REMOVED_FILES = ["scripts/verify-real-db.mjs", "tests/fixtures/cliproxy-prices"];
 for (const rel of REMOVED_FILES) {
 	try {
 		statSync(join(ROOT, rel));
@@ -157,8 +159,10 @@ for (const rel of REMOVED_FILES) {
 		/* 不存在 = 正确 */
 	}
 }
-// 源码里不得再出现只读 SQLite / 代理账本 / 价目表的痕迹
-const BANNED_IN_SOURCE = [/node:sqlite/, /usage_events/, /cliproxyapi/i, /litellm/i, /openrouter/i, /models\.dev/i];
+// 源码里不得再出现只读 SQLite / 代理账本的痕迹（价格源只允许出现在 lib/prices.mjs）
+const BANNED_IN_SOURCE = [/node:sqlite/, /usage_events/, /EasyCLIProxyAPI/];
+/** 允许外部 HTTPS 的来源白名单（只有价格表模块能引用）。 */
+const PRICE_HOSTS = ["models.dev", "raw.githubusercontent.com", "openrouter.ai"];
 const SKIP_DIRS = new Set(["node_modules", ".git", "coverage", ".cps-tmp", "docs"]);
 const walkSource = (dir) => {
 	for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -173,7 +177,14 @@ const walkSource = (dir) => {
 		const rel = join(dir, entry.name).slice(ROOT.length);
 		const body = readFileSync(join(dir, entry.name), "utf8");
 		for (const re of BANNED_IN_SOURCE) {
-			if (re.test(body)) fail(`${rel} 还在提代理账本 / 价目表（${re}），2.0 的数据源只有 pi 自己的调用`);
+			if (re.test(body)) fail(`${rel} 还在提代理账本（${re}），2.x 的数据源只有 pi 自己的调用`);
+		}
+		// 价格源主机只允许 lib/prices.mjs 引用（manifest 的描述文案除外，那是给用户看的说明）
+		const isManifest = entry.name === "manifest.json";
+		if (!isManifest && !rel.endsWith(join("lib", "prices.mjs"))) {
+			for (const host of PRICE_HOSTS) {
+				if (body.includes(host)) fail(`${rel} 引用了价格源主机 ${host}（只允许 lib/prices.mjs）`);
+			}
 		}
 	}
 };
@@ -181,6 +192,22 @@ try {
 	walkSource(ROOT);
 } catch (err) {
 	warn(`源码扫描跳过：${err.message}`);
+}
+
+// ── 7. 价格表：只允许三个固定来源，且必须能离线降级
+let priceSource = "";
+try {
+	priceSource = readFileSync(join(ROOT, "lib/prices.mjs"), "utf8");
+	for (const host of PRICE_HOSTS) {
+		if (!priceSource.includes(host)) fail(`lib/prices.mjs 缺少价格源 ${host}`);
+	}
+	const urls = [...priceSource.matchAll(/https:\/\/([A-Za-z0-9.-]+)/g)].map((m) => m[1]);
+	for (const host of urls) {
+		if (!PRICE_HOSTS.includes(host)) fail(`lib/prices.mjs 引用了未批准的价格源主机：${host}`);
+	}
+	if (!/PRICE_TTL_MS/.test(priceSource)) fail("lib/prices.mjs 必须带缓存 TTL");
+} catch (err) {
+	fail(`lib/prices.mjs 读不了：${err.message}`);
 }
 
 function report() {

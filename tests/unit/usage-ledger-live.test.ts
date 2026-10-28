@@ -249,19 +249,21 @@ afterEach(() => {
 });
 
 describe("activate：装配、订阅、降级", () => {
-	it("订阅 onRunEvent 并注册 4 个数据路由 + 3 个 POST 动作", () => {
+	it("订阅 onRunEvent 并注册 5 个数据路由 + 4 个 POST 动作", () => {
 		const { host } = makeHost();
 		boot(host);
 		expect(host.mock.handlers.onRunEvent?.length).toBe(1);
 		const paths = host.mock.routes.map((r) => `${r.method} ${r.path}`).sort();
 		expect(paths).toEqual([
 			"GET /api/meta",
+			"GET /api/prices",
 			"GET /api/records",
 			"GET /api/series",
 			"GET /api/summary",
 			"POST /api/backfill",
 			"POST /api/backfill/stop",
 			"POST /api/grant",
+			"POST /api/prices/refresh",
 		]);
 	});
 
@@ -595,5 +597,132 @@ describe("activate：覆盖率、续批与 2.0.1 账本迁移", () => {
 		// 迁移只跑一次：状态文件里记了 ledgerSchema
 		const state = JSON.parse(readFileSync(join(dataDir, BACKFILL_STATE_FILE), "utf8"));
 		expect(Number(state.ledgerSchema)).toBe(2);
+	});
+});
+
+// ─────────────────────────────────────────── 2.1.0 计价接线（价格表 → 看板）
+
+/** models.dev 形状的最小价格快照（只含本文件用到的两个模型）。 */
+const STUB_PRICES = {
+	google: {
+		models: {
+			"gemini-3.8-flash": { cost: { input: 0.75, output: 3.75, cache_read: 0.075 } },
+		},
+	},
+	xai: {
+		models: {
+			"grok-4.7": { cost: { input: 2, output: 6, cache_read: 0.5 } },
+		},
+	},
+	"alibaba-cn": {
+		models: {
+			"qwen3.8-flash": { cost: { input: 0.11875, output: 0.40073, cache_read: 0.014844 } },
+		},
+	},
+};
+
+/** 只让 models.dev 源成功，另两个源 500（验证「失败互不影响」）。 */
+function priceFetchStub() {
+	return vi.fn(async (url) => {
+		if (String(url).includes("models.dev")) {
+			return { ok: true, status: 200, text: async () => JSON.stringify(STUB_PRICES) };
+		}
+		return { ok: false, status: 500, text: async () => "" };
+	});
+}
+
+/** 造一个「网关没回填成本」的会话文件（cost.total = 0）。 */
+function zeroCostSession(model) {
+	const root = makeTmpDir("ul-zero-");
+	writeSessionFile(root, "--p--", "s.jsonl", [
+		sessionHeader({ id: "sess-zero" }),
+		assistantLine({
+			id: "a1",
+			ts: Date.now() - 1000,
+			model,
+			provider: "cliproxyapi",
+			usage: {
+				input: 1_000_000,
+				output: 0,
+				cacheRead: 500_000,
+				cacheWrite: 0,
+				reasoning: 0,
+				totalTokens: 1_500_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			durationMs: 5000,
+		}),
+	]);
+	return root;
+}
+
+describe("2.1.0 计价：SDK 为 0 时按价格表估算", () => {
+	it("网关不回填成本 → 记录用估算价，summary 同时给 SDK / 估算 / 占比", async () => {
+		const root = zeroCostSession("gemini-3.8-flash-high");
+		const { host } = makeHost({ fs: createMockFs(), settings: { sessionsDir: root }, fetch: priceFetchStub() });
+		boot(host);
+		await flush();
+
+		const summary = await callRoute(host, "GET", "/api/summary", { window: "all" });
+		expect(summary.ok).toBe(true);
+		expect(summary.summary.calls).toBe(1);
+		// 1M input * 0.75 + 0.5M cacheRead * 0.075 = 0.7875
+		expect(summary.summary.cost.amount).toBeCloseTo(0.7875, 6);
+		expect(summary.summary.cost.sdkAmount).toBe(0);
+		expect(summary.summary.cost.estimatedAmount).toBeCloseTo(0.7875, 6);
+		expect(summary.summary.cost.estimateShare).toBe(1);
+		expect(summary.summary.cacheHitRate).toBeCloseTo(0.5 / 1.5, 4);
+		// 价格表状态进 meta：可用、三源里两个失败
+		expect(summary.meta.prices.available).toBe(true);
+		expect(summary.meta.prices.failed.length).toBe(2);
+
+		const row = (await callRoute(host, "GET", "/api/records", { window: "all" })).records[0];
+		expect(row.costSource).toBe("estimate");
+		expect(row.costUsd).toBeCloseTo(0.7875, 6);
+		expect(row.priceId).toBe("modelsdev:google/gemini-3.8-flash");
+		expect(row.priceNote).toContain("cacheWrite≈input");
+	});
+
+	it("SDK 有真实成本时优先用 SDK（估算值只做对照）", async () => {
+		const tree = makeSessionTree();
+		const { host } = makeHost({ fs: createMockFs(), settings: { sessionsDir: tree.root }, fetch: priceFetchStub() });
+		boot(host);
+		await flush();
+		const summary = await callRoute(host, "GET", "/api/summary", { window: "all" });
+		expect(summary.summary.cost.amount).toBeCloseTo(0.020144, 6);
+		expect(summary.summary.cost.sdkAmount).toBeCloseTo(0.020144, 6);
+		expect(summary.summary.cost.estimatedAmount).toBe(0);
+		const row = (await callRoute(host, "GET", "/api/records", { window: "all" })).records[0];
+		expect(row.costSource).toBe("sdk");
+		expect(row.costEstimateUsd).toBeGreaterThan(0);
+	});
+
+	it("GET /api/prices?model= 枚举全部候选，chosen 是官方行", async () => {
+		const { host } = makeHost({ settings: {}, fetch: priceFetchStub() });
+		boot(host);
+		await flush();
+		const out = await callRoute(host, "GET", "/api/prices", { model: "Qwen3.8-Flash-Next" });
+		expect(out.ok).toBe(true);
+		expect(out.via).toBe("official");
+		expect(out.chosen.id).toBe("modelsdev:alibaba-cn/qwen3.8-flash");
+		expect(out.chosen.input).toBeCloseTo(0.11875, 9);
+		expect(Array.isArray(out.candidates)).toBe(true);
+		expect(out.candidates.length).toBeGreaterThanOrEqual(1);
+		expect(out.candidates[0]).toHaveProperty("provider");
+		expect(out.status.entries).toBeGreaterThan(0);
+	});
+
+	it("价格表和接口都不怕全失败：刷新返回 ok:false 但不抛错", async () => {
+		const failing = vi.fn(async () => ({ ok: false, status: 503, text: async () => "" }));
+		const { host } = makeHost({ settings: {}, fetch: failing });
+		boot(host);
+		await flush();
+		const out = await callRoute(host, "POST", "/api/prices/refresh");
+		expect(out.ok).toBe(false);
+		expect(out.status.lastError).toBeTruthy();
+		// 看板照常可读（空价格表 → 全部 --，而不是 500）
+		const summary = await callRoute(host, "GET", "/api/summary", { window: "today" });
+		expect(summary.ok).toBe(true);
+		expect(summary.summary.cost.amount).toBeNull();
 	});
 });

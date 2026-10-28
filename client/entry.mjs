@@ -13,7 +13,12 @@
  * 数字口径（与 lib/metrics.mjs / README 一致）：
  *  - `TTFT` = turn_start → 第一个流式包；**只能实时采集**，回填的历史条目没有 TTFT，
  *    所以看板必须显示 TTFT 覆盖率，不能把「样本少」伪装成「很快」；
- *  - `tok/s` = outputTokens / (durationMs/1000)，只有两者都 > 0 的调用参与均值；
+ *  - `tok/s` 主值 = **总输出 ÷ 总耗时**（ΣoutputTokens ÷ ΣdurationMs/1000）；
+ *    单次均值为 `tokPerSecMean`，只放在 tooltip 里（两个数不一样，不能混用）；
+ *  - `缓存命中率` = cacheRead ÷ (input + cacheRead + cacheWrite)，主值加权；
+ *    没有缓存字段的记录（老会话 / live）**排除出样本**，不算 0%；
+ *  - `成本` = SDK `usage.cost.total`（有且 > 0）优先，否则按价格表估算（`≈` 前缀）；
+ *    指标卡同时显示「其中估算」占比；两者都无 → `--`；
  *  - 失败 = `status: "error"`；`incomplete` = 事件没收到 message 或会话没有 usage。
  */
 // 独立仓库：不引 `@pi-web-ui/plugin-sdk/client`（浏览器里是裸 ESM，解析不到宿主别名），
@@ -41,6 +46,33 @@ const PAGE_SIZE = 20;
 // ──────────────────────────────────────────────────────────── 文案
 
 const ZH = {
+	cacheHitRate: "缓存命中率",
+	costEstimate: "其中估算",
+	costSdk: "SDK 成本",
+	tokpsNote: "总输出 ÷ 总耗时",
+	tokpsMean: "均值",
+	cacheHitNote: "Σ缓存读 ÷ Σ提示词 token",
+	pricesTable: "价格表（估算依据）",
+	priceModel: "模型",
+	priceChosen: "生效价格",
+	priceVia: "选取",
+	priceCandidates: "候选",
+	priceNone: "该模型在价格表里没有可用价格（显示 --）",
+	priceStatus: "价格表",
+	priceStale: "已过期",
+	priceNever: "未抓取",
+	priceRefresh: "刷新价格表",
+	priceOverrideHint:
+		"多来源差异大时，用设置项 priceOverrides 覆盖（USD / 1M token）：{\"模型名\":{\"input\":0.44,\"output\":1.32,\"cacheRead\":0.088}}",
+	viaOverride: "用户覆盖",
+	viaOfficial: "官方行",
+	viaMedian: "多源中位",
+	costSourceSdk: "SDK",
+	costSourceEstimate: "估算",
+	costSourceNone: "无价",
+	kvEstimate: "估算成本",
+	kvPriceId: "价格行",
+	kvCacheHit: "命中率",
 	title: "用量账本",
 	subtitle: "pi-web-ui 自己的每次模型调用（TTFT 只实时采集）",
 	win: { today: "今日", "7d": "7 天", "30d": "30 天", all: "全部" },
@@ -57,8 +89,8 @@ const ZH = {
 	latencyAvg: "平均延迟",
 	tokPerSec: "平均 tok·s⁻¹",
 	tokensTotal: "token 合计",
-	cost: "真实成本",
-	costNote: "SDK usage.cost.total",
+	cost: "成本",
+	costNote: "SDK usage.cost.total（缺价按价格表估算）",
 	tokensIn: "输入",
 	tokensOut: "输出",
 	cacheRead: "缓存读",
@@ -85,6 +117,7 @@ const ZH = {
 	thProvider: "provider",
 	thThinking: "思考",
 	thCache: "缓存读/写",
+	thCacheHit: "命中率",
 	thTtft: "首字",
 	thDuration: "耗时",
 	thStatus: "状态",
@@ -148,6 +181,33 @@ const ZH = {
 };
 
 const EN = {
+	cacheHitRate: "Cache hit rate",
+	costEstimate: "Estimated",
+	costSdk: "SDK cost",
+	tokpsNote: "total output ÷ total time",
+	tokpsMean: "mean",
+	cacheHitNote: "Σ cache read ÷ Σ prompt tokens",
+	pricesTable: "Price table (estimation basis)",
+	priceModel: "Model",
+	priceChosen: "Effective price",
+	priceVia: "Picked by",
+	priceCandidates: "Candidates",
+	priceNone: "No usable price for this model (shows --)",
+	priceStatus: "Price table",
+	priceStale: "stale",
+	priceNever: "never fetched",
+	priceRefresh: "Refresh prices",
+	priceOverrideHint:
+		"When sources disagree, override via settings `priceOverrides` (USD / 1M tokens): {\"model\":{\"input\":0.44,\"output\":1.32,\"cacheRead\":0.088}}",
+	viaOverride: "user override",
+	viaOfficial: "official row",
+	viaMedian: "multi-source median",
+	costSourceSdk: "SDK",
+	costSourceEstimate: "estimated",
+	costSourceNone: "unpriced",
+	kvEstimate: "estimated cost",
+	kvPriceId: "price row",
+	kvCacheHit: "hit rate",
 	title: "Usage Ledger",
 	subtitle: "pi-web-ui's own model calls (TTFT is live-only)",
 	win: { today: "Today", "7d": "7 days", "30d": "30 days", all: "All" },
@@ -164,8 +224,8 @@ const EN = {
 	latencyAvg: "Avg latency",
 	tokPerSec: "Avg tok·s⁻¹",
 	tokensTotal: "Tokens",
-	cost: "Real cost",
-	costNote: "SDK usage.cost.total",
+	cost: "Cost",
+	costNote: "SDK usage.cost.total (missing → price table)",
 	tokensIn: "input",
 	tokensOut: "output",
 	cacheRead: "cache read",
@@ -192,6 +252,7 @@ const EN = {
 	thProvider: "provider",
 	thThinking: "thinking",
 	thCache: "cache r/w",
+	thCacheHit: "hit rate",
 	thTtft: "first token",
 	thDuration: "duration",
 	thStatus: "Status",
@@ -324,11 +385,30 @@ function fmtTokps(x) {
 	return v.toFixed(v < 10 ? 2 : 0);
 }
 
-/** 真实成本（USD）。没有成本字段 → `--`（不是 $0）。 */
-export function fmtCost(amount) {
+/** USD / 1M token 的价格（价格表面板用）。null → `--`（没查到，不是 0）。 */
+function fmtPrice(x) {
+	if (x === null || x === undefined) return "--";
+	const v = Number(x);
+	if (!Number.isFinite(v)) return "--";
+	if (v === 0) return "0";
+	if (v < 0.01) return v.toFixed(6);
+	if (v < 1) return v.toFixed(4);
+	return v.toFixed(2);
+}
+
+/** 成本来源标签（SDK 真实 / 价格表估算 / 没价）。 */
+function costSourceLabel(source, d) {
+	if (source === "sdk") return d.costSourceSdk;
+	if (source === "estimate") return d.costSourceEstimate;
+	return d.costSourceNone;
+}
+
+/** 真实成本（USD）。没有成本字段 → `--`（不是 $0）。估算值前面加 `≈`。 */
+export function fmtCost(amount, source) {
 	const v = Number(amount);
 	if (amount === null || amount === undefined || !Number.isFinite(v)) return "--";
-	return `$${v.toFixed(v < 1 ? 4 : 2)}`;
+	const body = `$${v.toFixed(v < 1 ? 4 : 2)}`;
+	return source === "estimate" ? `≈${body}` : body;
 }
 
 function fmtHour(hour, _lang) {
@@ -623,10 +703,18 @@ export function renderCards(s, d) {
 	const cost = s.cost ?? { amount: null, unpricedCalls: 0, totalCalls: 0 };
 	const tokNote = `${s.tokPerSecSamples ?? 0} ${d.samples}`;
 	const tokenNote = `${d.tokensIn} ${fmtInt(tokens.input)} · ${d.tokensOut} ${fmtInt(tokens.output)} · ${d.cacheRead} ${fmtInt(tokens.cacheRead)} · ${d.cacheWrite} ${fmtInt(tokens.cacheWrite)} · ${d.reasoning} ${fmtInt(tokens.reasoning)}`;
+	const estimated = Number(cost.estimatedAmount) || 0;
+	const estimateShare = cost.estimateShare === null || cost.estimateShare === undefined ? null : Number(cost.estimateShare);
 	const costNote =
 		cost.amount === null
 			? `${d.costNote} · ${d.samples} 0`
-			: `${d.costNote}${cost.unpricedCalls ? ` · -- ${cost.unpricedCalls}` : ""}`;
+			: `${d.costNote}${estimated > 0 && estimateShare !== null ? ` · ${d.costEstimate} ${fmtShare(estimateShare)}` : ""}${cost.unpricedCalls ? ` · -- ${cost.unpricedCalls}` : ""}`;
+	const costTitle =
+		cost.amount === null
+			? `${d.costSdk} + ${d.costSourceEstimate}：本窗口没有任何可用价格`
+			: `${d.costSdk} ${fmtCost(cost.sdkAmount ?? null)} + ${d.costSourceEstimate} ${fmtCost(estimated, "estimate")}（占比 ${estimateShare === null ? "--" : fmtShare(estimateShare)}）；共 ${cost.pricedCalls ?? 0} 次有价 / ${cost.unpricedCalls ?? 0} 次无价`;
+	const cacheNote = `${d.samples} ${s.cacheHitSamples ?? 0}`;
+	const cacheTitle = `${d.cacheHitNote}；加权 ${fmtRate(s.cacheHitRate)}，${d.tokpsMean} ${fmtRate(s.cacheHitRateMean)}（${s.cacheHitSamples ?? 0} 次调用有缓存字段）`;
 	return `<div class="cps-cards">
 		${card(d.calls, fmtInt(calls), `${s.models ?? 0} ${d.modelsCount}`, `调用次数：${calls}`)}
 		${card(d.successRate, fmtRate(s.successRate), `${d.statusOk} ${s.ok ?? 0}`, `成功率 = 成功 / 全部调用（${s.ok ?? 0}/${calls}）`)}
@@ -640,9 +728,10 @@ export function renderCards(s, d) {
 		${card(d.ttftP90, ttft.p90 === null ? "--" : fmtMs(ttft.p90), ttft.coverage === null ? "" : `${d.ttftCoverage} ${fmtRate(ttft.coverage)}`, `首字时间 p90`)}
 		${card(d.ttftP99, ttft.p99 === null ? "--" : fmtMs(ttft.p99), `${d.samples} ${ttft.samples ?? 0}`, `首字时间 p99`)}
 		${card(d.latencyAvg, s.latencyAvg === null ? "--" : fmtMs(s.latencyAvg), `${d.samples} ${s.latencySamples ?? 0}`, `单次调用耗时均值（会话 durationMs / turn 时长）`)}
-		${card(d.tokPerSec, fmtTokps(s.tokPerSec), tokNote, `outputTokens / (durationMs/1000) 的均值`)}
+		${card(d.tokPerSec, fmtTokps(s.tokPerSec), `${d.tokpsNote} · ${tokNote}`, `${d.tokPerSec}：${d.tokpsNote}（Σ输出 ÷ Σ耗时）；${d.tokpsMean} ${fmtTokps(s.tokPerSecMean)}（${s.tokPerSecSamples ?? 0} 次调用）`)}
+		${card(d.cacheHitRate, fmtRate(s.cacheHitRate), cacheNote, cacheTitle)}
 		${card(d.tokensTotal, fmtInt(tokens.total), tokenNote, `token 合计：${tokenNote}`)}
-		${card(d.cost, fmtCost(cost.amount), costNote, `真实成本：SDK usage.cost.total 求和`)}
+		${card(d.cost, fmtCost(cost.amount), costNote, costTitle)}
 	</div>`;
 }
 
@@ -659,9 +748,10 @@ function renderModels(rows, d) {
 				<td class="mono">${esc(ttft.p50 === null || ttft.p50 === undefined ? "--" : fmtMs(ttft.p50))}</td>
 				<td class="mono">${esc(ttft.p90 === null || ttft.p90 === undefined ? "--" : fmtMs(ttft.p90))}</td>
 				<td class="mono">${esc(row.latencyAvg === null || row.latencyAvg === undefined ? "--" : fmtMs(row.latencyAvg))}</td>
-				<td class="mono">${esc(fmtTokps(row.tokPerSec))}</td>
+				<td class="mono" title="${esc(d.tokpsNote)}">${esc(fmtTokps(row.tokPerSec))}</td>
 				<td class="mono" title="${esc(`${d.tokensIn} ${row.tokens?.input ?? 0} · ${d.tokensOut} ${row.tokens?.output ?? 0} · ${d.cacheRead} ${row.tokens?.cacheRead ?? 0} · ${d.cacheWrite} ${row.tokens?.cacheWrite ?? 0} · ${d.reasoning} ${row.tokens?.reasoning ?? 0}`)}">${esc(fmtInt(row.tokens?.total ?? 0))}</td>
-				<td class="mono">${esc(fmtCost(row.cost?.amount ?? null))}</td>
+				<td class="mono" title="${esc(`${d.cacheHitNote}；${d.tokpsMean} ${fmtRate(row.cacheHitRateMean)}（${row.cacheHitSamples ?? 0} ${d.samples}）`)}">${esc(fmtRate(row.cacheHitRate))}</td>
+				<td class="mono" title="${esc(`${d.costSdk} ${fmtCost(row.cost?.sdkAmount ?? null)} + ${d.costSourceEstimate} ${fmtCost(row.cost?.estimatedAmount ?? null, "estimate")}`)}">${esc(fmtCost(row.cost?.amount ?? null))}</td>
 				<td class="mono">${esc(fmtShare(row.costShare ?? row.callShare ?? null))}</td>
 			</tr>`;
 		})
@@ -670,10 +760,46 @@ function renderModels(rows, d) {
 		<thead><tr>
 			<th>${esc(d.thModel)}</th><th>${esc(d.thCalls)}</th><th>${esc(d.thSuccess)}</th>
 			<th>${esc(d.thTtftP50)}</th><th>${esc(d.thTtftP90)}</th><th>${esc(d.thLatency)}</th>
-			<th>${esc(d.thTokps)}</th><th>${esc(d.thTokens)}</th><th>${esc(d.thCost)}</th><th>${esc(d.thShare)}</th>
+			<th title="${esc(d.tokpsNote)}">${esc(d.thTokps)}</th><th>${esc(d.thTokens)}</th><th title="${esc(d.cacheHitNote)}">${esc(d.thCacheHit)}</th><th>${esc(d.thCost)}</th><th>${esc(d.thShare)}</th>
 		</tr></thead>
 		<tbody>${body}</tbody>
 	</table></div>`;
+}
+
+/** 价格面板：每个模型用的哪一行价 + 候选数（brief A6：候选必须可枚举）。 */
+function renderPrices(box, d) {
+	if (!box) return `<div class="cps-empty">${esc(d.priceNever)}</div>`;
+	const status = box.status ?? {};
+	const rows = Array.isArray(box.models) ? box.models : [];
+	const sourceText = (status.sources ?? [])
+		.map((s) => `${s.label}:${s.ok ? s.count : "—"}`)
+		.join(" · ");
+	const stamp = status.fetchedAt ? fmtTime(status.fetchedAt) : d.priceNever;
+	const head = `<div class="cps-hint">${esc(d.priceStatus)}：${esc(stamp)}${status.stale ? ` · ${esc(d.priceStale)}` : ""} · ${esc(fmtInt(status.entries ?? 0))} 行${sourceText ? ` · ${esc(sourceText)}` : ""}${status.lastError ? ` · ${esc(status.lastError)}` : ""}
+		<button class="cps-btn" data-act="refreshPrices">${esc(d.priceRefresh)}</button></div>`;
+	if (!rows.length) return `${head}<div class="cps-empty">${esc(d.priceNone)}</div>`;
+	const viaLabel = { override: d.viaOverride, official: d.viaOfficial, median: d.viaMedian };
+	const body = rows
+		.map((row) => {
+			const prices = row.priceId
+				? `${fmtPrice(row.input)} / ${fmtPrice(row.output)} / ${fmtPrice(row.cacheRead)} / ${fmtPrice(row.cacheWrite)}`
+				: "--";
+			return `<tr><td>${esc(row.model)}</td>
+				<td class="cps-c-dim">${esc(viaLabel[row.via] ?? "--")}</td>
+				<td class="mono cps-c-dim"><code>${esc(row.priceId ?? "--")}</code></td>
+				<td class="mono">${esc(prices)}</td>
+				<td class="mono">${esc(fmtInt(row.candidates ?? 0))}</td></tr>`;
+		})
+		.join("");
+	return `${head}
+	<div class="cps-tbl-wrap"><table class="cps-tbl cps-prices">
+		<thead><tr>
+			<th>${esc(d.priceModel)}</th><th>${esc(d.priceVia)}</th>
+			<th>${esc(d.priceChosen)}</th><th title="${esc(`${d.tokensIn} / ${d.tokensOut} / ${d.cacheRead} / ${d.cacheWrite}（USD / 1M token）`)}">USD/1M</th><th>${esc(d.priceCandidates)}</th>
+		</tr></thead>
+		<tbody>${body}</tbody>
+	</table></div>
+	<div class="cps-hint">${esc(d.priceOverrideHint)}</div>`;
 }
 
 function statusBadge(status, d) {
@@ -716,14 +842,23 @@ function colVisible(state, col) {
 	return !hidden.includes(col);
 }
 
+/** 一条记录的缓存列：`读/写 · 命中%`（分母为 0 或老会话没有缓存字段 → `--`）。 */
+function fmtCacheCell(r) {
+	const rate = r.cacheHitRate === null || r.cacheHitRate === undefined ? null : Number(r.cacheHitRate);
+	const hit = rate === null || !Number.isFinite(rate) ? "--" : `${(rate * 100).toFixed(1)}%`;
+	return `${fmtInt(r.cacheReadTokens ?? 0)}/${fmtInt(r.cacheWriteTokens ?? 0)} · ${hit}`;
+}
+
 /** 组装 CSV 文本（带 BOM，Excel 中文不乱码）。
  *  纯函数：给定行数据与列清单返回字符串，单测可直接断言。 */
 export function buildCsv(rows, d) {
-	const head = [d.thTime, d.thModel, d.thProvider, d.thThinking, d.thTokens, d.thCache, d.thTtft, d.thDuration, d.thTokps, d.thCost, d.thStatus];
+	const head = [d.thTime, d.thModel, d.thProvider, d.thThinking, d.thTokens, d.thCache, d.thCacheHit, d.thTtft, d.thDuration, d.thTokps, d.thCost, d.thStatus];
 	const cells = (r) => {
 		const tokps =
 			Number(r.outputTokens) > 0 && Number(r.durationMs) > 0 ? Number(r.outputTokens) / (Number(r.durationMs) / 1000) : null;
 		const status = r.status === "error" ? d.statusFailed : r.status === "incomplete" ? d.statusIncomplete : d.statusOk;
+		// 缓存命中率：分母为 0 / 没有缓存字段 → 空（不是 0%）
+		const hit = r.cacheHitRate === null || r.cacheHitRate === undefined ? null : Number(r.cacheHitRate);
 		return [
 			new Date(Number(r.ts) || 0).toISOString(),
 			r.model ?? "",
@@ -731,6 +866,7 @@ export function buildCsv(rows, d) {
 			r.thinkingLevel ?? "",
 			String(Number(r.totalTokens ?? 0)),
 			`${Number(r.cacheReadTokens ?? 0)}/${Number(r.cacheWriteTokens ?? 0)}`,
+			hit === null || !Number.isFinite(hit) ? "" : (hit * 100).toFixed(2),
 			r.ttftMs === null || r.ttftMs === undefined ? "" : String(Number(r.ttftMs)),
 			r.durationMs === null || r.durationMs === undefined ? "" : String(Number(r.durationMs)),
 			tokps === null ? "" : tokps.toFixed(2),
@@ -761,11 +897,11 @@ function renderRecords(state, d) {
 				${colVisible(state, "provider") ? `<td class="cps-c-dim">${esc(r.provider ?? "--")}</td>` : ""}
 				${colVisible(state, "thinking") ? `<td class="cps-c-dim">${esc(r.thinkingLevel ?? "--")}</td>` : ""}
 				${colVisible(state, "tokens") ? `<td class="mono">${esc(fmtInt(r.totalTokens ?? 0))}</td>` : ""}
-				${colVisible(state, "cache") ? `<td class="mono cps-c-dim">${esc(`${fmtInt(r.cacheReadTokens ?? 0)}/${fmtInt(r.cacheWriteTokens ?? 0)}`)}</td>` : ""}
+				${colVisible(state, "cache") ? `<td class="mono cps-c-dim" title="${esc(`${d.kvCacheHit} = ${d.cacheRead} ÷ (${d.tokensIn} + ${d.cacheRead} + ${d.cacheWrite})`)}">${esc(fmtCacheCell(r))}</td>` : ""}
 				${colVisible(state, "ttft") ? `<td class="mono">${esc(r.ttftMs === null || r.ttftMs === undefined ? "--" : fmtMs(r.ttftMs))}</td>` : ""}
 				${colVisible(state, "duration") ? `<td class="mono">${esc(r.durationMs === null || r.durationMs === undefined ? "--" : fmtMs(r.durationMs))}</td>` : ""}
 				${colVisible(state, "tokps") ? `<td class="mono">${esc(fmtTokps(tokps))}</td>` : ""}
-				${colVisible(state, "cost") ? `<td class="mono">${esc(fmtCost(r.costUsd))}</td>` : ""}
+				${colVisible(state, "cost") ? `<td class="mono" title="${esc(`${costSourceLabel(r.costSource, d)}${r.priceId ? ` · ${r.priceId}` : ""}${r.priceNote ? ` · ${r.priceNote}` : ""}`)}">${esc(fmtCost(r.costUsd, r.costSource))}</td>` : ""}
 				${colVisible(state, "status") ? `<td>${statusBadge(r.status, d)}</td>` : ""}
 			</tr>`;
 			if (!open) return main;
@@ -776,8 +912,11 @@ function renderRecords(state, d) {
 				<b>${esc(d.kvCacheRead)}</b> ${esc(fmtInt(r.cacheReadTokens ?? 0))} ·
 				<b>${esc(d.kvCacheWrite)}</b> ${esc(fmtInt(r.cacheWriteTokens ?? 0))} ·
 				<b>${esc(d.kvReasoning)}</b> ${esc(fmtInt(r.reasoningTokens ?? 0))} ·
-				<b>${esc(d.kvTotal)}</b> ${esc(fmtInt(r.totalTokens ?? 0))}<br/>
+				<b>${esc(d.kvTotal)}</b> ${esc(fmtInt(r.totalTokens ?? 0))} ·
+				<b>${esc(d.kvCacheHit)}</b> ${esc(fmtRate(r.cacheHitRate))} ·
+				<b>${esc(d.kvEstimate)}</b> ${esc(fmtCost(r.costEstimateUsd, "estimate"))}<br/>
 				${esc(d.thSource)}：${esc(sourceLabel(r, d))} ·
+				${esc(d.cost)}：${esc(costSourceLabel(r.costSource, d))}${r.priceId ? ` · ${esc(d.kvPriceId)} <code>${esc(r.priceId)}</code>` : ""}${r.priceNote ? ` · ${esc(r.priceNote)}` : ""} ·
 				${esc(d.stopped)}：${esc(r.stopReason ?? "--")} ·
 				${esc(d.id)}：<code>${esc(r.id)}</code>
 			</td></tr>`;
@@ -932,6 +1071,10 @@ function renderDashboard(state, d) {
 				${renderModels(state.models ?? [], d)}
 			</div>
 			<div class="cps-panel">
+				<h3>${esc(d.pricesTable)}</h3>
+				${renderPrices(state.prices, d)}
+			</div>
+			<div class="cps-panel">
 				<h3>${esc(d.recordsTable)}</h3>
 				<div class="cps-filters">${statusSeg}${modelChip}</div>
 				${renderRecords(state, d)}
@@ -975,6 +1118,7 @@ const runtime = {
 		pageSize: PAGE_SIZE,
 		summary: null,
 		models: null,
+		prices: null,
 		series: null,
 		records: null,
 		pages: 1,
@@ -1036,6 +1180,7 @@ async function load() {
 		if (controller.signal.aborted) return;
 		runtime.state.summary = summary?.ok ? summary.summary : null;
 		runtime.state.models = summary?.ok ? (summary.models ?? []) : [];
+		runtime.state.prices = summary?.ok ? (summary.prices ?? null) : null;
 		runtime.state.series = series?.ok ? (series.series ?? []) : [];
 		runtime.state.records = records?.ok ? (records.records ?? []) : [];
 		runtime.state.pages = records?.pages ?? 1;
@@ -1172,6 +1317,10 @@ function onRootClick(event) {
 		}
 		if (act === "grant") {
 			void postAction("/api/grant");
+			return;
+		}
+		if (act === "refreshPrices") {
+			void postAction("/api/prices/refresh");
 			return;
 		}
 		if (act === "clearModel") {

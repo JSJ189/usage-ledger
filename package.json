@@ -1,8 +1,8 @@
 {
   "name": "pi-web-ui-plugin-usage-ledger",
-  "version": "2.0.3",
+  "version": "2.1.1",
   "private": false,
-  "description": "pi-web-ui 界面插件：记录 pi-web-ui 自己的每次模型调用（按模型统计 TTFT / 延迟 / token / 真实成本）",
+  "description": "pi-web-ui 界面插件：记录 pi-web-ui 自己的每次模型调用（按模型统计 TTFT / 延迟 / 吞吐 / 缓存命中率 / token / 成本，缺价按公开价格表估算）",
   "license": "MIT",
   "author": "JSJ189",
   "homepage": "https://github.com/JSJ189/usage-ledger",

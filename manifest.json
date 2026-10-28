@@ -2,14 +2,14 @@
 	"id": "usage-ledger",
 	"name": "用量账本",
 	"nameEn": "Usage Ledger",
-	"version": "2.0.3",
+	"version": "2.1.1",
 	"author": "JSJ189",
 	"homepage": "https://github.com/JSJ189/usage-ledger",
 	"license": "MIT",
 	"icon": "📊",
 	"iconSvg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M3 3v18h18\"/><rect x=\"7\" y=\"12\" width=\"3\" height=\"6\"/><rect x=\"12\" y=\"8\" width=\"3\" height=\"10\"/><rect x=\"17\" y=\"5\" width=\"3\" height=\"13\"/></svg>",
-	"description": "记录 pi-web-ui 自己的每一次模型调用：按模型统计调用数、成功率、TTFT 分位、单次耗时、输出速率、token 用量与 SDK 记录的真实成本。数据来自运行轨迹事件（实时 TTFT）与本机会话 JSONL（token / 成本 / 耗时，可回填历史），不读任何代理账本、不抓价目表、不估算金额。底栏显示今日调用数与 TTFT p50，点击打开看板。",
-	"descriptionEn": "Records pi-web-ui's own model calls: per-model call counts, success rate, TTFT percentiles, latency, throughput, token usage and the real cost reported by the SDK. Data comes from run-trace events (live TTFT) plus local session JSONL files (tokens / cost / duration, backfillable), with no proxy ledger, no price tables and no estimated amounts. The bottom bar shows today's call count and TTFT p50; click for the dashboard.",
+	"description": "记录 pi-web-ui 自己的每一次模型调用：按模型统计调用数、成功率、TTFT 分位、单次耗时、总输出÷总耗时的吞吐、缓存命中率、token 用量与成本。成本优先用 SDK 的 usage.cost.total；网关不回填时按公开价格表（models.dev / LiteLLM / OpenRouter，缓存 7 天）估算，并把 SDK 与估算分开展示。数据来自运行轨迹事件与本机会话 JSONL，不读任何代理账本。底栏显示今日调用数与 TTFT p50，点击打开看板。",
+	"descriptionEn": "Records pi-web-ui's own model calls: per-model call counts, success rate, TTFT percentiles, latency, throughput (total output ÷ total time), cache hit rate, token usage and cost. Cost prefers the SDK's usage.cost.total; when the gateway reports 0 it is estimated from public price tables (models.dev / LiteLLM / OpenRouter, cached for 7 days) and SDK vs estimated amounts are shown separately. Data comes from run-trace events plus local session JSONL files, with no proxy ledger. The bottom bar shows today's call count and TTFT p50; click for the dashboard.",
 	"apiVersion": 2,
 	"view": false,
 	"preload": true,
@@ -35,6 +35,13 @@
 			"label": "启动时回填 (Backfill on start)",
 			"default": true,
 			"hint": "插件激活时立刻跑一次增量回填；关掉后只在每 5 分钟的定时任务或点看板「回填」时跑。"
+		},
+		{
+			"key": "priceOverrides",
+			"type": "text",
+			"label": "价格覆盖 (Price overrides)",
+			"default": "",
+			"hint": "JSON，可选。当公开价格表里同一模型多来源差异大时，用它指定（USD / 每 1M token）：{\"DeepSeek-V4-Flash-0731\":{\"input\":0.44,\"output\":1.32,\"cacheRead\":0.088}}。留空 = 只用公开价格表；覆盖优先于一切来源。"
 		}
 	],
 	"ui": {

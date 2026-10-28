@@ -9,6 +9,8 @@ import {
 	MAX_PAGE_SIZE,
 	bucketKey,
 	byModel,
+	cacheHitRateOf,
+	cacheStats,
 	clampPageSize,
 	dayKey,
 	filterRecords,
@@ -20,11 +22,13 @@ import {
 	percentileOf,
 	percentiles,
 	projectRecord,
+	promptTokensOf,
 	resolveWindow,
 	series,
 	sumCost,
 	sumTokens,
 	summarize,
+	throughput,
 	tokPerSec,
 	WINDOW_KEYS,
 } from "../../lib/metrics.mjs";
@@ -166,6 +170,149 @@ describe("token / 成本 / 速率", () => {
 	it("没有任何可用样本时 tok/s 是 null", () => {
 		expect(tokPerSec([]).avg).toBeNull();
 		expect(tokPerSec([rec({ durationMs: 0 })]).avg).toBeNull();
+	});
+});
+
+describe("吞吐：主值是总体吞吐，均值只做对照（brief C）", () => {
+	it("weighted = Σoutput ÷ Σ耗时，与算术均值不是同一个数", () => {
+		const records = [
+			rec({ outputTokens: 1000, durationMs: 1000 }), // 1000 tok/s
+			rec({ outputTokens: 100, durationMs: 9000 }), // 11.1 tok/s
+		];
+		const t = throughput(records);
+		// 总体：1100 tokens / 10s = 110
+		expect(t.weighted).toBe(110);
+		// 均值：(1000 + 11.11) / 2 = 505.56
+		expect(t.mean).toBeCloseTo(505.56, 1);
+		expect(t.weighted).not.toBe(t.mean);
+		expect(t.samples).toBe(2);
+	});
+
+	it("除零样本被排除；无样本时两个值都是 null", () => {
+		const t = throughput([rec({ outputTokens: 0, durationMs: 1000 }), rec({ outputTokens: 100, durationMs: null })]);
+		expect(t).toEqual({ weighted: null, mean: null, samples: 0 });
+		expect(throughput([])).toEqual({ weighted: null, mean: null, samples: 0 });
+	});
+
+	it("旧 tokPerSec() 保留为均值（口径不断代）", () => {
+		const records = [rec({ outputTokens: 1000, durationMs: 1000 }), rec({ outputTokens: 100, durationMs: 9000 })];
+		expect(tokPerSec(records).avg).toBe(throughput(records).mean);
+	});
+
+	it("summarize 的 tokPerSec 换成 weighted，均值另给 tokPerSecMean", () => {
+		const s = summarize([rec({ outputTokens: 1000, durationMs: 1000 }), rec({ outputTokens: 100, durationMs: 9000 })]);
+		expect(s.tokPerSec).toBe(110);
+		expect(s.tokPerSecMean).toBeCloseTo(505.56, 1);
+		expect(s.tokPerSecSamples).toBe(2);
+	});
+});
+
+describe("缓存命中率（brief B）", () => {
+	it("promptTokens = input + cacheRead + cacheWrite；全缺 → null", () => {
+		expect(
+			promptTokensOf({ inputTokens: 1000, cacheReadTokens: 200, cacheWriteTokens: 50 }),
+		).toBe(1250);
+		expect(promptTokensOf({ inputTokens: null, cacheReadTokens: null, cacheWriteTokens: null })).toBeNull();
+		expect(promptTokensOf({ inputTokens: 100 })).toBe(100);
+	});
+
+	it("记录级命中率 = cacheRead / promptTokens；分母 0 → null", () => {
+		expect(cacheHitRateOf({ inputTokens: 800, cacheReadTokens: 200, cacheWriteTokens: 0 })).toBeCloseTo(0.2, 6);
+		expect(cacheHitRateOf({ inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 })).toBeNull();
+	});
+
+	it("没有缓存字段的老会话：排除出样本，不算 0%", () => {
+		// 1 条有缓存字段（命中 50%），1 条老会话没缓存字段（本身无法判断）
+		const stats = cacheStats([
+			rec({ inputTokens: 100, cacheReadTokens: 100, cacheWriteTokens: 0 }), // 100/200 = 50%
+			rec({ inputTokens: 500, cacheReadTokens: null, cacheWriteTokens: null }),
+		]);
+		expect(stats.samples).toBe(1);
+		expect(stats.weighted).toBe(0.5);
+		expect(stats.mean).toBe(0.5);
+	});
+
+	it("有缓存字段但一次没命中 = 0%（与「没字段」区分）", () => {
+		const stats = cacheStats([rec({ inputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0 })]);
+		expect(stats.samples).toBe(1);
+		expect(stats.weighted).toBe(0);
+	});
+
+	it("加权与算术均值不同值（大 prompt 的权重更大）", () => {
+		const stats = cacheStats([
+			rec({ inputTokens: 10, cacheReadTokens: 10, cacheWriteTokens: 0 }), // 10/20 = 50%
+			rec({ inputTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0 }), // 0/1000 = 0%
+		]);
+		// 加权：10 / 1020 ≈ 0.0098；均值：(0.5 + 0) / 2 = 0.25
+		expect(stats.weighted).toBeCloseTo(0.0098, 4);
+		expect(stats.mean).toBe(0.25);
+		expect(stats.weighted).not.toBe(stats.mean);
+	});
+
+	it("空账本 / 全无缓存字段 → weighted 与 mean 都是 null，samples = 0", () => {
+		expect(cacheStats([])).toEqual({ weighted: null, mean: null, samples: 0 });
+		const s = summarize([rec({ cacheReadTokens: null, cacheWriteTokens: null })]);
+		expect(s.cacheHitRate).toBeNull();
+		expect(s.cacheHitSamples).toBe(0);
+	});
+
+	it("summarize 同时给加权主值与均值、样本数", () => {
+		const s = summarize([
+			rec({ inputTokens: 10, cacheReadTokens: 10, cacheWriteTokens: 0 }),
+			rec({ inputTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0 }),
+		]);
+		expect(s.cacheHitRate).toBeCloseTo(0.0098, 4);
+		expect(s.cacheHitRateMean).toBe(0.25);
+		expect(s.cacheHitSamples).toBe(2);
+	});
+});
+
+describe("成本三段：SDK / 估算 / 无价（brief A5）", () => {
+	it("amount = sdkAmount + estimatedAmount，estimateShare = 估算占比", () => {
+		const c = sumCost([
+			rec({ costUsd: 0.6, costSource: "sdk" }),
+			rec({ costUsd: 0.2, costSource: "estimate" }),
+			rec({ costUsd: 0.2, costSource: "estimate" }),
+			rec({ costUsd: null, costSource: null }),
+		]);
+		expect(c.amount).toBeCloseTo(1, 6);
+		expect(c.sdkAmount).toBeCloseTo(0.6, 6);
+		expect(c.estimatedAmount).toBeCloseTo(0.4, 6);
+		expect(c.estimateShare).toBeCloseTo(0.4, 4);
+		expect(c.pricedCalls).toBe(3);
+		expect(c.unpricedCalls).toBe(1);
+	});
+
+	it("全部无价 → amount 与 estimateShare 都是 null（不造 $0）", () => {
+		const c = sumCost([rec({ costUsd: null, costSource: null })]);
+		expect(c.amount).toBeNull();
+		expect(c.estimateShare).toBeNull();
+		expect(c.estimatedAmount).toBe(0);
+	});
+
+	it("没有 costSource 的旧记录按 SDK 计（向后兼容）", () => {
+		const c = sumCost([rec({ costUsd: 0.5 })]);
+		expect(c.sdkAmount).toBe(0.5);
+		expect(c.estimatedAmount).toBe(0);
+	});
+
+	it("projectRecord 带出计价字段与命中率（前端不用猜）", () => {
+		const p = projectRecord(
+			rec({
+				cacheReadTokens: 100,
+				costUsd: 0.02,
+				costSource: "estimate",
+				costEstimateUsd: 0.02,
+				priceId: "modelsdev:xai/grok-4.7",
+				priceNote: "cacheWrite≈input",
+			}),
+		);
+		expect(p.costSource).toBe("estimate");
+		expect(p.costEstimateUsd).toBe(0.02);
+		expect(p.priceId).toBe("modelsdev:xai/grok-4.7");
+		expect(p.priceNote).toBe("cacheWrite≈input");
+		expect(p.promptTokens).toBe(1100);
+		expect(p.cacheHitRate).toBeCloseTo(100 / 1100, 6);
 	});
 });
 

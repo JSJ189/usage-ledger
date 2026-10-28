@@ -12,6 +12,7 @@ const DICT = {
 	thThinking: "思考",
 	thTokens: "Token",
 	thCache: "缓存",
+	thCacheHit: "缓存命中率",
 	thTtft: "首字",
 	thDuration: "耗时",
 	thTokps: "速度",
@@ -59,12 +60,19 @@ describe("buildCsv", () => {
 		expect(lines[1]).toContain("成功");
 	});
 
+	it("缓存命中率列：有值写成百分比，没样本留空（不写 0）", () => {
+		const withRate = buildCsv([{ ...row, cacheHitRate: 0.1241 }], DICT).split("\r\n")[1].split(",");
+		expect(withRate[6]).toBe("12.41");
+		const withoutRate = buildCsv([{ ...row, cacheHitRate: null }], DICT).split("\r\n")[1].split(",");
+		expect(withoutRate[6]).toBe("");
+	});
+
 	it("null TTFT / 成本不写成 0（留空）", () => {
 		const csv = buildCsv([{ ...row, ttftMs: null, costUsd: null, outputTokens: 0 }], DICT);
 		const cells = csv.split("\r\n")[1].split(",");
-		expect(cells[6]).toBe("");
-		expect(cells[8]).toBe("");
+		expect(cells[7]).toBe("");
 		expect(cells[9]).toBe("");
+		expect(cells[10]).toBe("");
 	});
 
 	it("含逗号/引号/换行的值必须转义", () => {

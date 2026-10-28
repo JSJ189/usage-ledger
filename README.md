@@ -2,18 +2,19 @@
 
 [![CI](https://github.com/JSJ189/usage-ledger/actions/workflows/ci.yml/badge.svg)](https://github.com/JSJ189/usage-ledger/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![manifest](https://img.shields.io/badge/manifest-2.0.1-informational)
-![permissions](https://img.shields.io/badge/permissions-ui%20%7C%20storage%20%7C%20http%20%7C%20fs%3Aread-brightgreen)
+![manifest](https://img.shields.io/badge/manifest-2.1.0-informational)
+![permissions](https://img.shields.io/badge/permissions-ui%20%7C%20http%20%7C%20fs%3Aread-brightgreen)
 
-pi-web-ui 界面插件：记录 **pi-web-ui 自己发出的每一次模型调用**，按模型统计调用数、成功率、TTFT 分位、单次耗时、输出速率、token 用量与**真实成本**（SDK 的 `usage.cost.total`，不估算）。底栏常驻「今日调用数 / TTFT p50」，点击打开看板。
+pi-web-ui 界面插件：记录 **pi-web-ui 自己发出的每一次模型调用**，按模型统计调用数、成功率、TTFT 分位、单次耗时、吞吐（`tok·s⁻¹`）、缓存命中率、token 用量与**成本**。成本优先用 SDK 记录的 `usage.cost.total`；网关不回填（`cost.total = 0`）时按公开价格表估算，并把「SDK 成本 / 其中估算」分开展示。底栏常驻「今日调用数 / TTFT p50」，点击打开看板。
 
-数据全部来自本机 pi-web-ui 自己的运行：
+数据来源：
 
 | 数据 | 来源 | 说明 |
 | --- | --- | --- |
 | TTFT | `host.onRunEvent` 的 `turn_first_token.durationMs` | **只能实时采集**；历史回填的条目没有 TTFT |
 | token（输入/输出/缓存读/缓存写/推理） | 会话 JSONL 的 `message.usage` | 可回填历史 |
-| 真实成本 USD | 会话 JSONL 的 `message.usage.cost.total` | 与宿主显示的数字同源 |
+| SDK 成本 USD | 会话 JSONL 的 `message.usage.cost.total` | 与宿主显示的数字同源 |
+| 估算成本 USD | 公开价格表（models.dev / LiteLLM / OpenRouter） | 仅当 SDK 成本为 0 / 缺失时生效，缓存 7 天 |
 | 单次调用耗时 | 会话 JSONL 的 `message.durationMs`；无则用 turn 时长 | 可回填历史 |
 | 模型 / provider / 停止原因 | 会话 JSONL + `message` 运行事件 | 两路按「同一次调用」1:1 配对 |
 
@@ -34,10 +35,20 @@ pi-web-ui install JSJ189/usage-ledger
 `manifest.permissions = ["ui", "http", "fs:read"]`。
 
 - `fs:read`：读 `~/.pi/agent/sessions/**/*.jsonl`，这是**唯一**能拿到逐轮 token 与真实成本的地方（宿主的 `UiMessage` 不带 token）。它会让 registry 风险等级从 LOW 升到 **MEDIUM，安装时需人工确认**——这是拿到 token 数据的必要代价。插件对该目录**只读**，绝不写入；路径可用设置项 `sessionsDir` 覆盖，首次访问由宿主弹窗授权（`host.fs.requestAccess`）。
-- `http`：插件自己的看板数据路由（`host.route("/api/…")`）。**没有网络请求**：不抓价目表、不访问任何外部主机，`netAllowlist` 已删除。
-- `storage` / `ui`：底栏徽标与看板视图。
+- `http`：插件自己的看板数据路由（`host.route("/api/…")`）+ **价格表抓取**（`host.fetch`，只有三个固定 HTTPS 主机）。**不访问任何用户数据主机**，不上传任何内容。
+- `ui`：底栏徽标与看板视图。
 
 不给 `fs:read`（或用户拒绝授权）也能用：只采实时事件，token 与成本显示 `--`，底栏写「仅实时」，看板顶部给「授权并导入历史」按钮。
+
+价格表只用三个固定地址：
+
+| 源 | 地址 | 单位 |
+| --- | --- | --- |
+| models.dev | `https://models.dev/api.json` | USD / 1M（原样） |
+| LiteLLM | `https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json` | USD / token（×1e6） |
+| OpenRouter | `https://openrouter.ai/api/v1/models` | USD / token 字符串（×1e6）|
+
+抓取结果只缓存在插件自己的数据目录（`<host.dataDir>/prices.json`，TTL 7 天），不写任何外部文件；三个源失败互不影响，失败只在看板标出，不影响统计。
 
 ## 账本存在哪
 
@@ -62,17 +73,27 @@ pi-web-ui install JSJ189/usage-ledger
 
 ## 看板
 
-- 指标卡：调用数、成功率、失败/未收全、TTFT p50/p90/p99（带**样本数**与**覆盖率**）、平均延迟、平均 `tok·s⁻¹`、token 明细、真实成本。
-- **按模型汇总**（用户第一诉求）：每行一个模型，调用数、成功率、TTFT p50/p90、平均延迟、`tok·s⁻¹`、token、成本、占比；点行 = 只看该模型。
+- 指标卡：调用数、成功率、失败/未收全、TTFT p50/p90/p99（带**样本数**与**覆盖率**）、平均延迟、`tok·s⁻¹`（**总输出 ÷ 总耗时**）、**缓存命中率**（加权，带 `n=` 样本数）、token 明细、成本（SDK 合计 + **其中估算**占比）。
+- **按模型汇总**（用户第一诉求）：每行一个模型，调用数、成功率、TTFT p50/p90、平均延迟、`tok·s⁻¹`、token、**命中率**、成本、占比；点行 = 只看该模型。`tok·s⁻¹` 与命中率的算术均值放在 tooltip 里（`均值 xx`）。
+- **价格表**面板：每个模型命中的价格行（`source:provider/model`）、四项价（USD / 1M）、候选数、失败源，以及 `priceOverrides` 写法。
 - 趋势：按小时 / 按天，两张手写 SVG 图（调用数 + TTFT p90）。
-- 记录明细：时间 / 模型 / provider / 思考档 / token / 缓存 / 首字 / 耗时 / `tok·s⁻¹` / 成本 / 状态；状态筛选、分页、点行展开拆分与来源。
+- 记录明细：时间 / 模型 / provider / 思考档 / token / 缓存（`读/写 · 命中%`）/ 首字 / 耗时 / `tok·s⁻¹` / 成本（估算显示 `≈`）/ 状态；状态筛选、分页、点行展开拆分与来源、导出 CSV（含「缓存命中率」列）。
 
 ## 口径
 
 - **TTFT** = `turn_start` → 第一个流式包（`Date.now() - turnStartAt`）。**历史回填的条目没有 TTFT**：看板必须显示覆盖率，不能把「样本少」当成「很快」。
 - **成功率** = `status === "ok"` / 全部调用。`failed` = `status === "error"`；`incomplete` = 没收到 `message` 事件或会话里没有 `usage` 块（老会话 / 中断），这类记录 token 与成本不可信。
-- **平均 `tok·s⁻¹`** = 每次调用 `outputTokens / (durationMs / 1000)` 的均值，只算 `durationMs > 0 && outputTokens > 0`（除零样本排除）。
-- **成本** = `usage.cost.total` 求和，不估算、不乘系数；没有成本字段的调用单独计 `unpricedCalls`，金额显示 `--` 而不是 `$0`。
+- **`tok·s⁻¹`（主值）= 总体吞吐** = `ΣoutputTokens / (ΣdurationMs / 1000)`，只算 `durationMs > 0 && outputTokens > 0` 的调用。它回答「这段时间整体多快」。
+  - 另一个数 `tokPerSecMean` = 每次 `outputTokens / (durationMs / 1000)` 的**算术均值**（2.0 的旧口径），回答「单次调用平均多快」。长尾慢调用在总体吞吐里按耗时占比加权，所以两个数通常不相等；看板主值用总体吞吐，均值只放 tooltip。
+  - 记录表每行仍是「本条 `outputTokens / (durationMs / 1000)`」，不参与总体口径。
+- **缓存命中率** = `cacheReadTokens / promptTokens`，其中 `promptTokens = inputTokens + cacheReadTokens + cacheWriteTokens`。
+  - 汇总/按模型的主口径是**加权** `ΣcacheRead / ΣpromptTokens`；另给算术均值 `cacheHitRateMean` 与样本数 `cacheHitSamples`。
+  - 分母为 0，或该记录**根本没有缓存字段**（老会话 / live 只采到 message）→ `null`（显示 `--`），这类记录**排除出样本**，绝不算成 0%。
+- **成本**：`costUsd` 是**生效成本**——SDK `usage.cost.total > 0` 就用 SDK（`costSource: "sdk"`）；否则按价格表估算（`costSource: "estimate"`，看板显示 `≈`）；两者都无 → `null`（显示 `--`，不是 `$0`）。
+  - 每条记录都保留 `costEstimateUsd`（估算值，供对照）与 `priceId`（命中的价格行）。
+  - 汇总 `summary.cost = {amount, sdkAmount, estimatedAmount, estimateShare, pricedCalls, unpricedCalls}`，`amount = sdkAmount + estimatedAmount`，看板显示「其中估算 X%」。
+  - 估算公式：`(input*pIn + output*pOut + cacheRead*pCacheRead + cacheWrite*pCacheWrite) / 1e6`（价都是 USD / 1M token）。缺 `cacheRead` / `cacheWrite` 价 → 按 `pIn` 计，并在 `priceNote` 标 `cacheRead≈input` / `cacheWrite≈input`；**绝不把缺价当 0**。
+  - 价格行选择：`priceOverrides`（用户覆盖）→ 官方厂商行（`qwen*`→alibaba-cn/alibaba，`gemini*`→google，`grok*`→xai，`mimo*`→xiaomi，`deepseek*`→deepseek/alibaba*；匹配先剥 `provider/` 前缀与 `-high` / `-next` / `-1017` 这类变体后缀，层内按 models.dev > LiteLLM > OpenRouter 取）→ 多来源中位数 → `null`。所有候选可用 `GET /api/prices?model=` 枚举。
 
 ## HTTP 接口
 
@@ -83,7 +104,9 @@ pi-web-ui install JSJ189/usage-ledger
 | `GET /api/summary?window=&model=` | 指标卡 + 按模型汇总。`window` = `today` / `7d` / `30d` / `all` |
 | `GET /api/series?window=&model=&bucket=` | 趋势，`bucket` = `hour` / `day` |
 | `GET /api/records?window=&model=&status=&page=&pageSize=` | 记录明细（分页，最新在前） |
-| `GET /api/meta` | 账本规模、会话目录、上次回填（含 `coverage{imported,eligible,remaining}` 与 `importing`）、授权状态 |
+| `GET /api/meta` | 账本规模、会话目录、上次回填（含 `coverage{imported,eligible,remaining}` 与 `importing`）、授权状态、价格表状态 |
+| `GET /api/prices?model=` | 价格候选：全部候选行（来源 / 供应商 / 四项价）+ 选中的那行；不带 `model` 时列账本里出现过的模型 |
+| `POST /api/prices/refresh` | 强制刷新价格表（失败保留旧快照，恒 200）|
 | `POST /api/backfill` | 立刻跑一次增量回填（会清掉「停止导入」标记） |
 | `POST /api/backfill/stop` | 停止自动续批导入 |
 | `POST /api/grant` | 申请 `sessions` 目录读取（宿主弹窗），成功后自动回填 |
@@ -95,27 +118,37 @@ pi-web-ui install JSJ189/usage-ledger
 | `sessionsDir` | text | `""` | 会话目录绝对路径，留空 = 自动解析 |
 | `backfillDays` | text | `"30"` | 回填天数（1–3650） |
 | `backfillOnStart` | boolean | `true` | 激活时立刻回填一次 |
+| `priceOverrides` | text | `""` | JSON，USD / 每 1M token，例如 `{"DeepSeek-V4-Flash-0731":{"input":0.44,"output":1.32,"cacheRead":0.088}}`；优先于一切来源 |
 
-## 与 1.0 的破坏性差异
+## 与 1.0 / 2.0 的关系
 
-2.0 不再读任何代理账本、不抓价目表、不估算成本，`dbPath` / `autoDiscover` / `searchRoots` / `cacheTtlSec` / `priceOverrides` 设置项已删除，`net` 权限已删除。详见 [CHANGELOG](CHANGELOG.md)。
+2.0 不读任何代理账本（`dbPath` / `autoDiscover` / `searchRoots` 设置项与 `net` 权限已删）。2.1 把「公开价格表估算」加回来，但**只用来补 SDK 没给的成本**，且只用 `host.fetch`（不需要 `net` 权限）：SDK 给了非 0 成本时永远用 SDK。详见 [CHANGELOG](CHANGELOG.md)。
 
 ## 开发
 
 ```bash
 npm ci
-npm test                     # vitest：账本/会话/聚合/实时/看板 单测
-npm run check                # manifest 自检（字段、权限、版本、残留检查）
+npm test                     # vitest：账本/会话/聚合/实时/价格表/看板 单测（全部离线）
+npm run check                # manifest 自检（字段、权限、版本、价格源白名单、残留检查）
 npm run verify:sessions -- 7 # 拿真实的 ~/.pi/agent/sessions 跑一遍只读回填，并与独立复算对照
 ```
 
-`verify-real-sessions.mjs` 里有一个人工独立复算的参考值（Python 直扫会话 JSONL，不经过本插件代码）：脚本会打印调用数 / token / 成本 / 每模型调用数与参考值的偏差（%），偏差 > 2% 时以非 0 退出，并区分「文件覆盖不足」与「去重误合并」。参考值只在 7 天窗口有效。
+`verify-real-sessions.mjs` 的价格来源（估算成本用）：
 
-单测不触碰真实会话目录：会话 fixture 与 `host.fs` 替身在 `tests/support/`。
+- `--prices <目录>`（默认 `.cps-tmp`）：读该目录下已下载的 `modelsdev.json` / `litellm.json` / `openrouter.json`（形状同三个公开源），**不联网**；
+- `--fetch`：现场抓三个源（慢，需要网络）；
+- 都没有：只报 SDK 成本，估算那几栏显示 `--`。
+
+脚本会打印调用数 / token / **SDK 成本 / 估算成本 / 估算占比** / 各模型**缓存命中率**。其中与参考值的偏差：**SDK 成本**做硬判定（> 2% 非 0 退出），调用数与 token 只做记录——参考值是固定的历史快照，滚动窗口会随新数据增长。
+
+脚本里的参考值来自人工独立复算（Python 直扫会话 JSONL，不经过本插件代码）：它会区分「文件覆盖不足」「批次没扫完」「去重误合并」三种归因。参考值只在 7 天窗口有效，且是**历史快照**。
+
+单测不触碰真实会话目录，也不联网：会话 fixture 与 `host.fs` 替身在 `tests/support/`，价格 fixture 在 `tests/fixtures/prices/`，`host.fetch` 一律打桩。
 
 ## 隐私
 
-所有数据都在本机：账本写在自己的 data 目录，会话目录只读，**没有任何出站网络请求**（插件不含 `net` 权限）。
+- 账本与价格缓存都在本机插件数据目录；会话目录只读。
+- 出站请求只有价格表的三个固定 HTTPS 地址（`models.dev` / `raw.githubusercontent.com` / `openrouter.ai`），不携带任何用量数据，不上传任何内容。价格结果缓存 7 天，期间不再联网。
 
 ## License
 

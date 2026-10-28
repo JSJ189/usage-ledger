@@ -41,7 +41,11 @@ function summaryPayload() {
 			latencyMax: 40_000,
 			latencySamples: 1200,
 			tokPerSec: 42.5,
+			tokPerSecMean: 51.2,
 			tokPerSecSamples: 1200,
+			cacheHitRate: 0.42,
+			cacheHitRateMean: 0.55,
+			cacheHitSamples: 900,
 			tokens: {
 				input: 1_500_000,
 				output: 90_000,
@@ -50,7 +54,15 @@ function summaryPayload() {
 				reasoning: 12_000,
 				total: 2_502_000,
 			},
-			cost: { amount: 12.3456, pricedCalls: 1200, unpricedCalls: 34, totalCalls: 1234 },
+			cost: {
+				amount: 12.3456,
+				sdkAmount: 10.3456,
+				estimatedAmount: 2,
+				estimateShare: 2 / 12.3456,
+				pricedCalls: 1200,
+				unpricedCalls: 34,
+				totalCalls: 1234,
+			},
 			models: 3,
 			providers: 2,
 		},
@@ -65,8 +77,20 @@ function summaryPayload() {
 				ttft: { samples: 600, p50: 6498, p90: 9000, p99: 12_000 },
 				latencyAvg: 12_000,
 				tokPerSec: 1014.9,
+				tokPerSecMean: 980.5,
+				cacheHitRate: 0.8,
+				cacheHitRateMean: 0.7,
+				cacheHitSamples: 800,
 				tokens: { input: 1e6, output: 5e4, cacheRead: 8e5, cacheWrite: 0, reasoning: 0, total: 1_850_000 },
-				cost: { amount: 10.5, pricedCalls: 890, unpricedCalls: 10, totalCalls: 900 },
+				cost: {
+					amount: 10.5,
+					sdkAmount: 10.5,
+					estimatedAmount: 0,
+					estimateShare: 0,
+					pricedCalls: 890,
+					unpricedCalls: 10,
+					totalCalls: 900,
+				},
 				callShare: 900 / 1234,
 				costShare: 10.5 / 12.3456,
 				providers: ["antigravity"],
@@ -88,6 +112,34 @@ function summaryPayload() {
 				providers: ["cliproxyapi"],
 			},
 		],
+		prices: {
+			status: {
+				available: true,
+				stale: false,
+				fetchedAt: RECORD_TS,
+				entries: 1234,
+				sources: [
+					{ id: "modelsdev", label: "models.dev", ok: true, count: 1000, ms: 10, error: null },
+					{ id: "litellm", label: "LiteLLM", ok: false, count: 0, ms: 0, error: "HTTP 500" },
+				],
+				failed: ["LiteLLM"],
+				lastError: null,
+			},
+			models: [
+				{
+					model: "gemini-3.8-flash-high",
+					via: "official",
+					priceId: "modelsdev:google/gemini-3.8-flash",
+					source: "modelsdev",
+					provider: "google",
+					input: 0.75,
+					output: 3.75,
+					cacheRead: 0.075,
+					cacheWrite: null,
+					candidates: 3,
+				},
+			],
+		},
 	};
 }
 
@@ -122,6 +174,12 @@ function recordsPayload() {
 				reasoningTokens: 20,
 				totalTokens: 1500,
 				costUsd: 0.0123,
+				costSource: "estimate",
+				costEstimateUsd: 0.0123,
+				priceId: "modelsdev:google/gemini-3.8-flash",
+				priceNote: "cacheWrite≈input",
+				promptTokens: 1800,
+				cacheHitRate: 800 / 1800,
 				durationMs: 12_000,
 				ttftMs: 4000,
 				stopReason: "stop",
@@ -142,6 +200,9 @@ function recordsPayload() {
 				reasoningTokens: 0,
 				totalTokens: 10,
 				costUsd: null,
+				costSource: null,
+				promptTokens: 10,
+				cacheHitRate: 0,
 				durationMs: null,
 				ttftMs: null,
 				stopReason: "error",
@@ -612,6 +673,91 @@ describe("文件覆盖率必须可见（2.0.1）", () => {
 		await vi.waitFor(() =>
 			expect(state.calls.some((c) => c.url.includes("/api/backfill/stop") && c.method === "POST")).toBe(true),
 		);
+		cleanup();
+		container.remove();
+	});
+});
+
+// ─────────────────────────────────────────── 2.1.0：命中率 / 速度口径 / 价格表
+
+describe("2.1.0 看板：缓存命中率、速度口径、价格表", () => {
+	it("指标卡新增「缓存命中率」，带样本数；速度卡写明「总输出 ÷ 总耗时」并把均值放 tooltip", async () => {
+		stubFetch();
+		const { container, cleanup } = mountDashboard();
+		await vi.waitFor(() => expect(container.querySelector(".cps-cards")).toBeTruthy());
+		const html = container.innerHTML;
+		expect(html).toContain("缓存命中率");
+		expect(html).toContain("42.0%"); // 加权命中率
+		expect(html).toContain("样本 900");
+		expect(html).toContain("总输出 ÷ 总耗时");
+		// 均值只能出现在 tooltip 里，不能顶掉主值
+		const tokCard = [...container.querySelectorAll(".cps-card")].find((el) => el.textContent?.includes("tok·s⁻¹"));
+		expect(tokCard?.getAttribute("title") ?? "").toContain("均值 51");
+		cleanup();
+		container.remove();
+	});
+
+	it("成本卡同时显示 SDK 合计与「其中估算」占比", async () => {
+		stubFetch();
+		const { container, cleanup } = mountDashboard();
+		await vi.waitFor(() => expect(container.querySelector(".cps-cards")).toBeTruthy());
+		const html = container.innerHTML;
+		expect(html).toContain("$12.35");
+		expect(html).toContain("其中估算");
+		const costCard = [...container.querySelectorAll(".cps-card")].find((el) =>
+			(el.getAttribute("title") ?? "").includes("SDK 成本"),
+		);
+		expect(costCard?.getAttribute("title") ?? "").toContain("估算");
+		expect(costCard?.getAttribute("title") ?? "").toContain("$10.35");
+		cleanup();
+		container.remove();
+	});
+
+	it("按模型表有「命中率」列，记录表的缓存列是「读/写 · 命中%」", async () => {
+		stubFetch();
+		const { container, cleanup } = mountDashboard();
+		await vi.waitFor(() => expect(container.querySelector("tr[data-model]")).toBeTruthy());
+		const modelHead = container.querySelector("table.cps-models thead")?.textContent ?? "";
+		expect(modelHead).toContain("命中率");
+		const firstModelRow = container.querySelector("tr[data-model] td:nth-child(9)")?.textContent ?? "";
+		expect(firstModelRow).toContain("80.0%");
+		const cacheCell = container.querySelector("tr[data-rid] td:nth-child(6)")?.textContent ?? "";
+		expect(cacheCell).toContain("800/0");
+		expect(cacheCell).toContain("44.4%"); // 800 / (1000+800+0)
+		cleanup();
+		container.remove();
+	});
+
+	it("价格面板列出命中的价格行、候选数与失败源，并可点刷新", async () => {
+		stubFetch();
+		const { container, cleanup } = mountDashboard();
+		await vi.waitFor(() => expect(container.querySelector("table.cps-prices")).toBeTruthy());
+		const html = container.innerHTML;
+		expect(html).toContain("价格表");
+		expect(html).toContain("modelsdev:google/gemini-3.8-flash");
+		expect(html).toContain("官方行");
+		expect(html).toContain("LiteLLM:—"); // 失败的源显式标出来
+		const btn = [...container.querySelectorAll("[data-act='refreshPrices']")][0] as HTMLElement;
+		expect(btn).toBeTruthy();
+		btn.click();
+		await vi.waitFor(() =>
+			expect(state.calls.some((c) => c.url.includes("/api/prices/refresh") && c.method === "POST")).toBe(true),
+		);
+		cleanup();
+		container.remove();
+	});
+
+	it("估算成本的记录用 ≈ 前缀，展开明细能看到价格行", async () => {
+		stubFetch();
+		const { container, cleanup } = mountDashboard();
+		await vi.waitFor(() => expect(container.querySelector("tr[data-rid]")).toBeTruthy());
+		const html = container.innerHTML;
+		expect(html).toContain("≈$0.0123");
+		(container.querySelector("tr[data-rid]") as HTMLElement).click();
+		await vi.waitFor(() => expect(container.querySelector(".cps-detail")).toBeTruthy());
+		const detail = container.querySelector(".cps-detail")?.textContent ?? "";
+		expect(detail).toContain("modelsdev:google/gemini-3.8-flash");
+		expect(detail).toContain("估算成本");
 		cleanup();
 		container.remove();
 	});

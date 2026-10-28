@@ -1,0 +1,83 @@
+{
+	"data": [
+		{
+			"id": "google/gemini-3.8-flash",
+			"name": "Gemini 3.8 Flash",
+			"pricing": {
+				"prompt": "0.000000825",
+				"completion": "0.000004125",
+				"input_cache_read": "0.0000000825"
+			}
+		},
+		{
+			"id": "x-ai/grok-4.7",
+			"name": "Grok 4.7",
+			"pricing": {
+				"prompt": "0.000002",
+				"completion": "0.000006",
+				"input_cache_read": "0.0000005"
+			}
+		},
+		{
+			"id": "qwen/qwen3.8-flash",
+			"name": "Qwen3.8 Flash",
+			"pricing": {
+				"prompt": "0.00000015",
+				"completion": "0.00000047",
+				"input_cache_read": "0.000000016"
+			}
+		},
+		{
+			"id": "deepseek/deepseek-v4.1-flash",
+			"name": "DeepSeek V4.1 Flash",
+			"pricing": {
+				"prompt": "0.00000014",
+				"completion": "0.00000042",
+				"input_cache_read": "0.0000000042"
+			}
+		},
+		{
+			"id": "deepseek/deepseek-v4-flash",
+			"name": "DeepSeek V4 Flash",
+			"pricing": {
+				"prompt": "0.000000091",
+				"completion": "0.000000182",
+				"input_cache_read": "0.0000000182"
+			}
+		},
+		{
+			"id": "deepseek/deepseek-v4-flash-0731",
+			"name": "DeepSeek V4 Flash 0731",
+			"pricing": {
+				"prompt": "0.000000119",
+				"completion": "0.000000238",
+				"input_cache_read": "0.0000000238"
+			}
+		},
+		{
+			"id": "xiaomi/mimo-v2.6-pro",
+			"name": "MiMo v2.6 Pro",
+			"pricing": {
+				"prompt": "0.000000435",
+				"completion": "0.00000087",
+				"input_cache_read": "0.0000000036"
+			}
+		},
+		{
+			"id": "some-proxy/mystery-model-1",
+			"name": "Mystery Model 1",
+			"pricing": {
+				"prompt": "0.00000035",
+				"completion": "0.0000011",
+				"input_cache_read": "0.000000035"
+			}
+		},
+		{
+			"id": "some-proxy/no-output-model",
+			"name": "No Output Model",
+			"pricing": {
+				"prompt": "0.0000005"
+			}
+		}
+	]
+}

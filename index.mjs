@@ -1,7 +1,7 @@
 /**
- * usage-ledger 2.0 服务端入口
+ * usage-ledger 2.1 服务端入口
  *
- * 记录的是 **pi-web-ui 自己的模型调用**，不读任何代理账本、不抓价目表、不估算成本。
+ * 记录的是 **pi-web-ui 自己的模型调用**。
  *
  * 数据两路合流：
  *  1. **实时**（`host.onRunEvent`，见 lib/live.mjs）：TTFT 只能这样拿到；
@@ -14,11 +14,17 @@
  *   - live 与回填靠 **1:1 贪心配对**合并（同 model / 同 provider / |Δts| ≤ 3s，各只能认领一次）。
  *  账本是 `host.dataDir/ledger.jsonl`（append-only，见 lib/ledger.mjs）。
  *
+ * 2.1.0 新增计价：SDK 没回填成本（内网网关 `cost.total = 0`）时，按公开价格表估算，
+ * 见 lib/prices.mjs。**计价发生在读取侧**（`store.query` 之后、聚合之前），账本里只存
+ * SDK 原值，所以刷新价格表不需要重写账本。
+ *
  * 对外路由（浏览器侧只走这些，全部 200 + `ok:false` 降级，不刷红）：
  *  - `GET  /api/summary?window=&model=`          指标卡 + 按模型汇总
  *  - `GET  /api/series?window=&model=&bucket=`    趋势（hour | day）
  *  - `GET  /api/records?window=&model=&status=&page=&pageSize=`
- *  - `GET  /api/meta`                             账本/回填/授权/覆盖率状态
+ *  - `GET  /api/meta`                             账本/回填/授权/覆盖率/价格表状态
+ *  - `GET  /api/prices?model=`                    价格表候选（来源 / 供应商 / 四项价）
+ *  - `POST /api/prices/refresh`                   强制刷新价格表（失败也不 500）
  *  - `POST /api/backfill`                         立刻跑一次增量回填（会清掉「停止」标记）
  *  - `POST /api/backfill/stop`                    停止自动续批导入
  *  - `POST /api/grant`                            申请 sessions 目录读取（宿主弹窗）
@@ -38,6 +44,7 @@ import {
 } from "./lib/sessions.mjs";
 import * as metrics from "./lib/metrics.mjs";
 import { createLiveCollector } from "./lib/live.mjs";
+import { createPriceBook, PRICE_CACHE_FILE } from "./lib/prices.mjs";
 
 const BADGE_ID = "usage-ledger-badge";
 const DAY_MS = 86_400_000;
@@ -114,6 +121,7 @@ export function createStateStore({ dir, file, log } = {}) {
  * @param {object} options
  * @param {ReturnType<typeof createLedgerStore>} options.store
  * @param {ReturnType<typeof createSessionImporter>|null} [options.importer]
+ * @param {ReturnType<typeof createPriceBook>|null} [options.prices] 价格簿（缺省 = 不估算）
  * @param {() => Record<string, unknown>} [options.getSettings]
  * @param {(level:string, ...args:unknown[])=>void} [options.log]
  * @param {() => number} [options.now]
@@ -123,6 +131,7 @@ export function createStatsService(options = {}) {
 	const log = typeof options.log === "function" ? options.log : () => {};
 	const now = typeof options.now === "function" ? options.now : () => Date.now();
 	let importer = options.importer ?? null;
+	const priceBook = options.prices ?? null;
 	const liveStats = typeof options.liveStats === "function" ? options.liveStats : () => null;
 	const cache = new Map();
 	let backfillInflight = null;
@@ -160,12 +169,54 @@ export function createStatsService(options = {}) {
 		grantState = { required: false, reason: "", reasonEn: "", hint: "", hintEn: "", ...(info ?? {}) };
 	}
 
+	/**
+	 * 给一批记录补计价字段（新对象，绝不改账本里的原记录）。
+	 *
+	 * 性能：价格解析在价格簿里按模型记忆化，这里每条记录只做几次乘法；
+	 * 价格表本身也只在快照 / 覆盖配置变化时重建索引（brief 硬约束 8）。
+	 */
+	function priced(records) {
+		if (!priceBook || !Array.isArray(records)) return records;
+		return records.map((record) => priceBook.price(record));
+	}
+
 	function windowRecords(params = {}) {
 		const win = metrics.resolveWindow(params.window, now());
 		const model = typeof params.model === "string" ? params.model.trim() : "";
-		const all = store.query({ fromMs: win.fromMs, toMs: win.toMs });
+		const all = priced(store.query({ fromMs: win.fromMs, toMs: win.toMs }));
 		const records = model ? all.filter((r) => metrics.modelKey(r) === model) : all;
 		return { win, model, records };
+	}
+
+	/**
+	 * 价格表概览（给 /api/summary 的 `prices` 字段与看板的价格面板）。
+	 * 只列本窗口出现过的模型：每个模型一条首选价 + 候选条数。
+	 */
+	function priceOverview(records) {
+		if (!priceBook) return null;
+		const seen = new Set();
+		const rows = [];
+		for (const record of records) {
+			const model = metrics.modelKey(record);
+			if (seen.has(model)) continue;
+			seen.add(model);
+			const resolved = priceBook.resolve(model);
+			const price = resolved?.price ?? null;
+			rows.push({
+				model,
+				via: resolved?.via ?? null,
+				priceId: price?.id ?? null,
+				source: price?.source ?? null,
+				provider: price?.provider ?? null,
+				input: price?.input ?? null,
+				output: price?.output ?? null,
+				cacheRead: price?.cacheRead ?? null,
+				cacheWrite: price?.cacheWrite ?? null,
+				candidates: Array.isArray(resolved?.candidates) ? resolved.candidates.length : 0,
+			});
+		}
+		rows.sort((a, b) => a.model.localeCompare(b.model));
+		return { status: priceBook.status(), models: rows };
 	}
 
 	/** 能否真正读到会话：能力在 + 目录已授权（未授权时上一次回填会把 required 置 true）。 */
@@ -192,6 +243,8 @@ export function createStatsService(options = {}) {
 			backfillError,
 			grant: grantState,
 			live: liveStats(),
+			// 价格表状态：缺失 / 过期 / 失败源都要让用户看见（估算的可信度取决于它）
+			prices: priceBook ? priceBook.status() : null,
 			...extra,
 		};
 	}
@@ -207,6 +260,7 @@ export function createStatsService(options = {}) {
 			meta: baseMeta(win, { model, cached: false }),
 			summary: metrics.summarize(records),
 			models: metrics.byModel(records),
+			prices: priceOverview(records),
 		};
 		return remember("summary", key, payload);
 	}
@@ -242,9 +296,62 @@ export function createStatsService(options = {}) {
 		};
 	}
 
-	/** 状态页数据（授权 / 回填 / 账本规模）。 */
+	/** 状态页数据（授权 / 回填 / 账本规模 / 价格表）。 */
 	function meta() {
 		return { ok: true, meta: baseMeta(metrics.resolveWindow("all", now())) };
+	}
+
+	/**
+	 * 价格表候选枚举（brief A6：`GET /api/prices?model=xxx` 返回所有候选）。
+	 *
+	 * - 带 `model`：返回该模型的全部候选行（来源 / 供应商 / 四项价）+ 选中的那行；
+	 * - 不带：列出账本里出现过的模型（最多 50 个）各一条首选价 + 候选条数，
+	 *   方便直接在设置里填 `priceOverrides`。
+	 */
+	function prices(params = {}) {
+		if (!priceBook) {
+			return { ok: false, code: "no-prices", reason: "价格表不可用", reasonEn: "Price table unavailable" };
+		}
+		const status = priceBook.status();
+		const model = typeof params.model === "string" ? params.model.trim() : "";
+		if (model) {
+			const resolved = priceBook.resolve(model);
+			return {
+				ok: true,
+				status,
+				model,
+				via: resolved.via,
+				chosen: resolved.price,
+				candidates: resolved.candidates,
+			};
+		}
+		const seen = new Set();
+		const models = [];
+		for (const record of store.list()) {
+			const key = metrics.modelKey(record);
+			if (seen.has(key)) continue;
+			seen.add(key);
+			if (models.length >= 50) break;
+			const resolved = priceBook.resolve(key);
+			models.push({
+				model: key,
+				via: resolved.via,
+				priceId: resolved.price?.id ?? null,
+				candidates: resolved.candidates.length,
+			});
+		}
+		return { ok: true, status, models };
+	}
+
+	/** 强制刷新价格表（失败保留旧快照，恒 200）。 */
+	async function refreshPrices() {
+		if (!priceBook) {
+			return { ok: false, code: "no-prices", reason: "价格表不可用", reasonEn: "Price table unavailable" };
+		}
+		const status = await priceBook.refresh();
+		priceBook.invalidate();
+		bust();
+		return { ok: status.available === true, status, meta: baseMeta(metrics.resolveWindow("all", now())) };
 	}
 
 	/** 写入一批记录（回填用）；返回写入统计。 */
@@ -321,7 +428,7 @@ export function createStatsService(options = {}) {
 	/** 底栏徽标：今日调用数 / TTFT p50；没有 fs:read 时写 `仅实时`。 */
 	function badge() {
 		const win = metrics.resolveWindow("today", now());
-		const records = store.query({ fromMs: win.fromMs, toMs: win.toMs });
+		const records = priced(store.query({ fromMs: win.fromMs, toMs: win.toMs }));
 		const summary = metrics.summarize(records);
 		const liveOnly = !fsUsable();
 		const backfill = importer?.summary(lastBackfill) ?? null;
@@ -335,19 +442,27 @@ export function createStatsService(options = {}) {
 			coverage && coverage.eligible > 0
 				? `, imported ${coverage.imported}/${coverage.eligible} session files${backfill?.truncated ? " (importing…)" : ""}`
 				: "";
+		const estimateNote =
+			summary.cost.estimatedAmount > 0 && summary.cost.estimateShare !== null
+				? `（其中估算 $${summary.cost.estimatedAmount.toFixed(4)}，占 ${(summary.cost.estimateShare * 100).toFixed(0)}%）`
+				: "";
+		const estimateNoteEn =
+			summary.cost.estimatedAmount > 0 && summary.cost.estimateShare !== null
+				? ` (estimated $${summary.cost.estimatedAmount.toFixed(4)}, ${(summary.cost.estimateShare * 100).toFixed(0)}%)`
+				: "";
 		const body = liveOnly
 			? "仅实时"
 			: `${fmtInt(summary.calls)}/${summary.ttft.p50 === null ? "--" : fmtMs(summary.ttft.p50)}`;
 		const tail = liveOnly
 			? "（没有 fs:read：只采实时事件，token 与成本为 --；点开看板可授权导入历史）"
-			: `，失败 ${summary.failed}，TTFT p50 ${summary.ttft.p50 === null ? "--" : fmtMs(summary.ttft.p50)}，平均延迟 ${summary.latencyAvg === null ? "--" : fmtMs(summary.latencyAvg)}，输出 ${fmtInt(summary.tokens.output)} tokens，成本 ${summary.cost.amount === null ? "--" : `$${summary.cost.amount.toFixed(4)}`}${covZh}`;
+			: `，失败 ${summary.failed}，TTFT p50 ${summary.ttft.p50 === null ? "--" : fmtMs(summary.ttft.p50)}，平均延迟 ${summary.latencyAvg === null ? "--" : fmtMs(summary.latencyAvg)}，输出 ${fmtInt(summary.tokens.output)} tokens，成本 ${summary.cost.amount === null ? "--" : `$${summary.cost.amount.toFixed(4)}`}${estimateNote}${covZh}`;
 		return {
 			label: "用量账本",
 			badge: body,
 			hint: `📊 今日模型用量：${summary.calls} 次调用${tail}`,
 			hintEn: liveOnly
 				? "📊 Today's model usage: live-only (no fs:read; tokens and cost show --). Open the dashboard to authorize history import."
-				: `📊 Today's model usage: ${summary.calls} calls, ${summary.failed} failed, TTFT p50 ${summary.ttft.p50 === null ? "--" : fmtMs(summary.ttft.p50)}, avg latency ${summary.latencyAvg === null ? "--" : fmtMs(summary.latencyAvg)}, output ${fmtInt(summary.tokens.output)} tokens, cost ${summary.cost.amount === null ? "--" : `$${summary.cost.amount.toFixed(4)}`}${covEn}`,
+				: `📊 Today's model usage: ${summary.calls} calls, ${summary.failed} failed, TTFT p50 ${summary.ttft.p50 === null ? "--" : fmtMs(summary.ttft.p50)}, avg latency ${summary.latencyAvg === null ? "--" : fmtMs(summary.latencyAvg)}, output ${fmtInt(summary.tokens.output)} tokens, cost ${summary.cost.amount === null ? "--" : `$${summary.cost.amount.toFixed(4)}`}${estimateNoteEn}${covEn}`,
 		};
 	}
 
@@ -356,6 +471,8 @@ export function createStatsService(options = {}) {
 		series,
 		recordsPage,
 		meta,
+		prices,
+		refreshPrices,
 		badge,
 		ingest,
 		runBackfill,
@@ -391,6 +508,16 @@ export function activate(host) {
 
 	const stateStore = createStateStore({ dir: dataDir, file: BACKFILL_STATE_FILE, log });
 	const state = stateStore.load();
+
+	// ── 价格簿（2.1.0）：只读缓存，不阻塞启动；缓存缺失 / 过期才后台刷新
+	const priceBook = createPriceBook({
+		dir: dataDir,
+		fetch: typeof host.fetch === "function" ? host.fetch.bind(host) : null,
+		getSettings: settingsOf,
+		log,
+	});
+	priceBook.load();
+	log("debug", `价格缓存：${join(dataDir, PRICE_CACHE_FILE)}（${priceBook.status().entries} 行）`);
 
 	// 2.0.0 → 2.0.1 一次性账本重建：
 	// 2.0.0 拿 `ts + model + provider` 给回填记录去重，同一毫秒的多次真实调用被折叠成一条，
@@ -428,6 +555,7 @@ export function activate(host) {
 	const service = createStatsService({
 		store,
 		importer: buildImporter(),
+		prices: priceBook,
 		getSettings: settingsOf,
 		log,
 		liveStats: () => live.stats(),
@@ -573,6 +701,9 @@ export function activate(host) {
 			}),
 		);
 		host.route("POST", "/api/backfill/stop", guard(() => ({ ...stopBackfill(), meta: service.meta().meta })));
+		host.route("GET", "/api/prices", guard((req) => service.prices(req?.query ?? {})));
+		// 刷新失败也只能 200 + ok:false（失败源记在 status.sources[].ok）
+		host.route("POST", "/api/prices/refresh", guard(() => service.refreshPrices()));
 		host.route(
 			"POST",
 			"/api/grant",
@@ -639,6 +770,9 @@ export function activate(host) {
 		try {
 			const off = host.onSettingsChanged(() => {
 				service.setImporter(buildImporter());
+				// priceOverrides 可能改了：清记忆化并按需刷新价格表
+				priceBook.invalidate();
+				void priceBook.ensureFresh();
 				void syncNow({ force: true });
 			});
 			if (typeof off === "function") disposers.push(off);
@@ -649,6 +783,12 @@ export function activate(host) {
 
 	// 启动：先出徽标（本地账本，无需授权），再后台跑一次增量回填
 	refreshBadge();
+	// 价格表：缓存缺失 / 过期才联网（TTL 7 天）；失败只记日志，不影响看板
+	try {
+		priceBook.ensureFresh();
+	} catch (err) {
+		log("warn", "价格表刷新调度失败：", String(err?.message ?? err));
+	}
 	const settingsAtBoot = settingsOf();
 	if (settingsAtBoot.backfillOnStart !== false) {
 		void syncNow({ force: true });
@@ -674,4 +814,4 @@ export function activate(host) {
 
 export default { activate };
 /** 便于单测/诊断的再导出。 */
-export { DAY_MS, CACHE_TTL_MS, BADGE_INTERVAL_MS, BACKFILL_INTERVAL_MS, RECORD_STATUS, metrics };
+export { DAY_MS, CACHE_TTL_MS, BADGE_INTERVAL_MS, BACKFILL_INTERVAL_MS, RECORD_STATUS, metrics, PRICE_CACHE_FILE };
