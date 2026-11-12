@@ -1,5 +1,63 @@
 # CHANGELOG
 
+## 3.0.0（2026-11-12）
+
+一次架构级重写：读路径改为「预聚合 rollup + SQLite」，导入移到 worker 线程，客户端重写为差分渲染 + URL 状态。
+
+### 修掉的致命问题（都有实测数字）
+
+- **7 天/30 天切换像卡死**：计价热路径每条记录都调 `host.getSettings()`，宿主实现是 2 次 `readFileSync`（42.3µs/次）。7 天 2.1 秒、30 天 15.1 秒、全部 18.9 秒，全部同步压在宿主事件循环上。
+  现在：设置只在激活/设置变更时读一次，之后走内存快照；读路径只查内存 rollup → **30 天 overview ≤50ms**。
+- **点「全部」直接崩**：`metrics.summarize` 里 `Math.max(...149005 条)` 抛 `RangeError: Maximum call stack size exceeded`，整个看板掉进单一错误态。
+  现在：所有聚合改成对 rollup 行（≤几千行）循环，且分位只从直方图合并求值。
+- **首次导入卡死半天，连 pi-web-ui 都用不了**：每条记录一次 `appendFileSync`（15 万条实测 **47.6 秒**纯同步 IO）+ 每轮整文件 `readFile`（单文件最大 73.6MB）+ 每轮重写 309KB 状态文件。
+  现在：解析与写库都在 `worker_threads` 里，流式 `createReadStream` + 单事务 2000 行；主线程单次阻塞 **≤16ms**（10ms 心跳实测）。
+- **「一直在回填」永不结束**：续批判据是 `remaining > 0`，而活跃会话文件永远在增长 → 每 10 秒（`host.schedule` 被 clamp）续批一次、上限 500 轮 ≈ 83 分钟，5 分钟定时器再拉起。
+  现在：自调度 `setTimeout` 链 + 只看「本批是否有净新增/还有 changed 文件」+ 指数退避（100ms → 2s → 10s → 60s → 300s），可暂停/继续/取消。
+- **关掉浏览器就不记账**：manifest 只有 `preload: true`，而宿主 boot 期只激活 `alwaysOn` 插件。
+  现在：`"alwaysOn": true`。
+- **账本写进了宿主全局目录**：`host.dataDir` 是 `~/.pi-web` 而不是插件目录，v2 把 134MB 的 `ledger.jsonl` 直接丢在根里。
+  现在：`<dataDir>/plugin-data/usage-ledger/ledger.sqlite`，旧文件原样保留（迁移只读，不删）。
+- **每次启动都让账本变大**：`load()` 合并重复行时还会 `appendFileSync`（实测启动一次 +1,687 行 / +1.76MB）。
+  现在：迁移一次性搬进 SQLite，之后靠唯一索引幂等，启动不再写任何东西。
+
+### 数据层
+
+- 存储：`node:sqlite`（Node 内建，零原生依赖）；`journal_mode=WAL`、`synchronous=NORMAL`、`busy_timeout=5000`。
+- 表：`calls`（明细，索引 `ts` / `model_id,ts` / `status,ts`）、`refs`（模型/供应商/项目/会话文件字典）、`rollup_hour` / `rollup_day`（只存可合并量）、`meta`。
+- 分位：对数直方图（8 bins/octave，1ms–4h）存 BLOB，读取时跨桶合并求值，误差 ≤3%，UI 标 `≈`；不做「存算好的 p95」。
+- 幂等：`entry_key` 唯一索引 + `ON CONFLICT DO UPDATE`；同一会话重复导入不重复计账。
+- 口径写死：`calls` 不含 `aborted`/`incomplete`；`successRate` 分母排除这两类；`in_tok` 是非缓存输入；`cost` 四态（sdk / estimate / unpriced / 未采集），缺价单独成桶并标「≥ 下限」。
+- `cost.total = 0` 一律按「网关未回填」处理走估算（实测本机 150,714 行里 92.5% 是 0，把 0 当真值会让成本整体显示成 $0）。
+
+### 导入子系统
+
+- `worker_threads` 隔离；字节游标 + 半行保留；单批 ≤500 行 / ≤8MB / ≤60ms。
+- 状态机 `idle → scanning → importing ⇄ paused → done`，进度（文件数/行数/ETA）1-2 秒可见。
+- 接口全部立即返回（`/api/v3/import/start|pause|resume|cancel`），停止粒度到「批」。
+- v2 账本自动迁移（后台、幂等、保留原文件）。
+
+### 客户端
+
+- 首屏只发 2 个请求（`overview` + `import/status`），一次查询驱动 KPI/图/TopN。
+- 差分渲染（`data-k` 键 + `patch()`），不再整页 `innerHTML`；刷新不丢滚动与焦点。
+- 四态齐备：骨架 / ready / stale-while-error（保留旧图 + banner）/ 按 `code` 分支的错误文案。
+- 请求带 `AbortSignal.timeout(8000)` + 请求代数守卫（旧响应不会覆盖新状态）。
+- 范围：今日/24h/7d/30d/90d/全部/自定义；粒度 `auto|5m|1h|1d`（自动保证 ≤720 点）。
+- 图表：crosshair + shared tooltip（含桶区间与口径）+ 图例可点隐藏系列 + KPI sparkline。
+- 表格：keyset 分页 / 本地排序（明示「仅当前页」）+ 列显隐持久化；时间统一本地时区。
+- 状态进 URL：`#ul?range=30d&gran=1h&model=all&status=all&view=chart`（只写非默认值）。
+- 导出走服务端流式 CSV（取消 5000 行上限，附口径脚注）。
+- a11y：分段控件 `role="tablist"`、KPI `aria-live`、表格 `role="table"`。
+
+### 破坏性变更 / 升级说明
+
+- 接口从 `/api/summary|series|records|meta` 换成 `/api/v3/overview|records|record|meta|import/*|export`；**v2 前端接口不再提供**（客户端同一版本一起换）。
+- 数据位置：`~/.pi-web/ledger.jsonl` → `~/.pi-web/plugin-data/usage-ledger/ledger.sqlite`。首次启动自动迁移，旧文件保留可回滚。
+- 设置项：保留 `sessionsDir` / `backfillDays` / `backfillOnStart` / `priceOverrides`，新增 `autoImport`。
+- 需要 Node ≥ 22.5（`node:sqlite`）。不满足时看板降级为 `ok:false, code:"no-sqlite"`，不崩、不写坏数据。
+- 卸载插件会删除 `plugin-data/usage-ledger/`（宿主行为），**卸载前请先导出**。
+
 ## 2.1.1
 
 - `scripts/verify-real-sessions.mjs` 判定口径修正：参考值是历史快照，滚动窗口的正偏差不再判失败；只拦「少算 / 覆盖不全 / truncated」，需要旧行为加 `--strict`

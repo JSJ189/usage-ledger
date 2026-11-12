@@ -2,21 +2,21 @@
 
 [![CI](https://github.com/JSJ189/usage-ledger/actions/workflows/ci.yml/badge.svg)](https://github.com/JSJ189/usage-ledger/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![manifest](https://img.shields.io/badge/manifest-2.1.0-informational)
+![manifest](https://img.shields.io/badge/manifest-3.0.0-informational)
 ![permissions](https://img.shields.io/badge/permissions-ui%20%7C%20http%20%7C%20fs%3Aread-brightgreen)
 
-pi-web-ui 界面插件：记录 **pi-web-ui 自己发出的每一次模型调用**，按模型统计调用数、成功率、TTFT 分位、单次耗时、吞吐（`tok·s⁻¹`）、缓存命中率、token 用量与**成本**。成本优先用 SDK 记录的 `usage.cost.total`；网关不回填（`cost.total = 0`）时按公开价格表估算，并把「SDK 成本 / 其中估算」分开展示。底栏常驻「今日调用数 / TTFT p50」，点击打开看板。
+pi-web-ui 界面插件：记录 **pi-web-ui 自己发出的每一次模型调用**，按模型 / 供应商 / 项目统计调用数、成功率、TTFT 与总耗时分位、加权吞吐（`tok·s⁻¹`）、缓存命中率、token 用量与**成本**。成本优先用 SDK 记录的 `usage.cost.total`；网关不回填时按公开价格表估算，并把「SDK 成本 / 估算 / 缺价」分开展示。底栏常驻「今日调用数 / TTFT p50」，点击打开看板。
 
-数据来源：
+3.0 的关键差别：**范围切换是毫秒级的**。历史数据在后台线程导入进 SQLite，读路径只查预聚合 rollup，导入期间看板照常可用。
 
 | 数据 | 来源 | 说明 |
 | --- | --- | --- |
-| TTFT | `host.onRunEvent` 的 `turn_first_token.durationMs` | **只能实时采集**；历史回填的条目没有 TTFT |
-| token（输入/输出/缓存读/缓存写/推理） | 会话 JSONL 的 `message.usage` | 可回填历史 |
-| SDK 成本 USD | 会话 JSONL 的 `message.usage.cost.total` | 与宿主显示的数字同源 |
-| 估算成本 USD | 公开价格表（models.dev / LiteLLM / OpenRouter） | 仅当 SDK 成本为 0 / 缺失时生效，缓存 7 天 |
-| 单次调用耗时 | 会话 JSONL 的 `message.durationMs`；无则用 turn 时长 | 可回填历史 |
-| 模型 / provider / 停止原因 | 会话 JSONL + `message` 运行事件 | 两路按「同一次调用」1:1 配对 |
+| TTFT | `host.onRunEvent` 的 `turn_first_token.durationMs` | **只能实时采集**；历史导入的条目没有 TTFT（看板显示覆盖率） |
+| token（输入/输出/缓存读/缓存写/推理） | 会话 JSONL 的 `message.usage` | 可导入历史 |
+| SDK 成本 USD | 会话 JSONL 的 `message.usage.cost.total` | 与宿主显示的数字同源。**实测本机网关 150,714 行里 92.5% 是 `0`**，所以 `0` 按「网关未回填」处理，走价格表估算；只有 `> 0` 才记为 `sdk` |
+| 估算成本 USD | 公开价格表（models.dev / LiteLLM / OpenRouter） | 仅当 SDK 未回填（`0`/缺失）时生效，缓存 7 天，带 `price_version` |
+| 单次耗时 | `turn_start → turn_end`（实时）或 `message.durationMs`（历史） | `gen_ms = e2e − ttft` |
+| 模型 / provider / 项目 / 停止原因 | 会话 JSONL + `message` 事件 | 两路按「确定性身份」合并，不靠时间窗猜 |
 
 ## 安装
 
@@ -26,129 +26,115 @@ pi-web-ui 界面插件：记录 **pi-web-ui 自己发出的每一次模型调用
 pi-web-ui install JSJ189/usage-ledger
 ```
 
-安装后重启/重扫插件，底栏出现 📊「用量账本」，点击打开看板。
+安装后重扫插件（或重启 pi-web-ui），底栏出现 📊「用量账本」，点击打开看板。
 
-要求：pi-web-ui（插件 `apiVersion: 2`）+ Node ≥ 22.13。**不需要**任何第三方代理软件或数据库。
+要求：pi-web-ui（插件 `apiVersion: 2`）+ **Node ≥ 22.5**（用内置 `node:sqlite`，不需要任何第三方数据库或代理软件）。Node 版本不够时插件不崩，看板会明确显示「统计不可用（no-sqlite）」。
 
 ## 权限说明（重要）
 
 `manifest.permissions = ["ui", "http", "fs:read"]`。
 
-- `fs:read`：读 `~/.pi/agent/sessions/**/*.jsonl`，这是**唯一**能拿到逐轮 token 与真实成本的地方（宿主的 `UiMessage` 不带 token）。它会让 registry 风险等级从 LOW 升到 **MEDIUM，安装时需人工确认**——这是拿到 token 数据的必要代价。插件对该目录**只读**，绝不写入；路径可用设置项 `sessionsDir` 覆盖，首次访问由宿主弹窗授权（`host.fs.requestAccess`）。
-- `http`：插件自己的看板数据路由（`host.route("/api/…")`）+ **价格表抓取**（`host.fetch`，只有三个固定 HTTPS 主机）。**不访问任何用户数据主机**，不上传任何内容。
+- `fs:read`：读 `~/.pi/agent/sessions/**/*.jsonl`，这是**唯一**能拿到逐轮 token 与真实成本的地方（宿主的 `UiMessage` 不带 token）。它会让 registry 风险等级从 LOW 升到 **MEDIUM，安装时需人工确认**——这是拿到 token 数据的必要代价。
+  插件对该目录**只读**（`createReadStream` 增量读，绝不写入）；路径可用设置项 `sessionsDir` 覆盖。3.0 起不再需要目录授权弹窗（插件与宿主同进程，直接用 `node:fs` 读），`POST /api/v3/grant` 仅作兼容入口保留。
+- `http`：看板数据路由（`host.route("/api/v3/…")`）+ 价格表抓取（`host.fetch`，只有三个固定 HTTPS 主机）。**不访问任何用户数据主机**，不上传任何内容。
 - `ui`：底栏徽标与看板视图。
-
-不给 `fs:read`（或用户拒绝授权）也能用：只采实时事件，token 与成本显示 `--`，底栏写「仅实时」，看板顶部给「授权并导入历史」按钮。
-
-价格表只用三个固定地址：
-
-| 源 | 地址 | 单位 |
-| --- | --- | --- |
-| models.dev | `https://models.dev/api.json` | USD / 1M（原样） |
-| LiteLLM | `https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json` | USD / token（×1e6） |
-| OpenRouter | `https://openrouter.ai/api/v1/models` | USD / token 字符串（×1e6）|
-
-抓取结果只缓存在插件自己的数据目录（`<host.dataDir>/prices.json`，TTL 7 天），不写任何外部文件；三个源失败互不影响，失败只在看板标出，不影响统计。
 
 ## 账本存在哪
 
-`<host.dataDir>/ledger.jsonl`（一行一条记录，append-only，崩溃最多丢最后一行）。
+```
+<dataDir>/plugin-data/usage-ledger/          # dataDir 默认 ~/.pi-web
+├── ledger.sqlite        # 主库（WAL）：明细 calls + 预聚合 rollup_hour / rollup_day
+├── ledger.sqlite-wal
+├── import-state.json    # 导入游标与进度（≤200KB）
+├── prices.json          # 价格表快照（7 天 TTL）
+└── backups/             # 迁移/压实前快照
+<dataDir>/ledger.jsonl   # 2.x 遗留账本：**只读保留**，首次启动自动迁移进 SQLite，不删
+```
 
-- 每条记录：`ts | conversationId | projectDir | provider | model | thinkingLevel | inputTokens | outputTokens | cacheReadTokens | cacheWriteTokens | reasoningTokens | totalTokens | costUsd | durationMs | ttftMs | stopReason | status | source(live|backfill) | sources[] | sessionFile | entryId | paired`。
-- **身份键与配对是两件事**（2.0.1 修复）：
-  - 回填记录的身份键**只有** `sessionFile + entry.id`（会话里每个 assistant 行的 `id` 唯一，一次调用一行）。**不用** `ts + model + provider` 去重：同一毫秒内多次调用（并行 / 子代理）真实存在，那样会把几十次真实调用合并成一条。
-  - live 记录的身份键是 `conversationId + turnStartAt`（一个对话同一时刻只有一个 turn）。
-  - live（有 TTFT、没 token）与回填（有 token、没 TTFT）是同一调用的两半，靠 **1:1 贪心配对**合并：同 `model` + 同 `provider` + `|Δts| ≤ 3000ms`，取 ts 最接近的一条；每条 live 最多认领一条回填，反过来也一样（认领过就带 `paired` 标记）。配不上就各自保留（live 只算实时那次、回填 TTFT 为 `null`），**绝不互相吞掉**。
-  - 配对口径：token / 成本 / 停止原因取回填；`ttftMs` 只取 live；`durationMs` 取 live（`turn_start`→`turn_end` 实测耗时），live 没有才用回填的 `message.durationMs`；状态以「非 incomplete 的真实结局」为准。
-- 回填进度存在 `<host.dataDir>/backfill-state.json`：每个文件的 `{mtime, size, offset, unit, ctx}`，下次只读新增字节。
-- **升级到 2.0.1 会重建一次账本**：2.0.0 用 `ts + model + provider` 去重，历史回填记录的 token / 成本已被错误合并、无法就地修复。激活时自动丢弃 `source: backfill` 的记录、清空回填 offset、把「回填 + live」混合记录退回纯 live，然后重新回填（会话目录只读，数据不丢，只是重算一遍）。**不需要**手动删 `ledger.jsonl`。
+- 账本**只在本机**，没有任何上传。
+- 卸载插件会删除 `plugin-data/usage-ledger/`（宿主行为），**卸载前请先用看板的「导出 CSV」备份**。
+- 需要备份时直接拷 `ledger.sqlite`（先让 pi-web-ui 空闲几秒，或同时拷 `-wal`）。
 
-## 回填（导入历史）
+## 导入（历史会话）
 
-- 位置：设置项 `sessionsDir` → `$PI_CODING_AGENT_DIR/sessions` → `~/.pi/agent/sessions`。
-- 范围：只回填 `mtime` 在 `backfillDays`（默认 30，夹取 1–3650）内的文件；单次最多 200 个文件（按 mtime 新→旧）、单文件超过 100MB 跳过并记日志；每处理一个文件让出一次事件循环。
-- **覆盖率显式暴露**：批次没扫完（`truncated`）时自动隔 2 秒续批，直到扫完或用户在看板点「停止导入」；底栏 tooltip 与看板顶部始终写「已导入 X/M 个会话文件」，导入中额外标「导入中…」。不允许「看起来已完成，其实只导了 1/4」。
-- 触发：激活时一次（`backfillOnStart` 可关）、每 5 分钟一次增量、看板「回填」按钮、授权成功后立刻一次。
-- 只读：全程走 `host.fs` 的跨目录读接口，插件不会写这个目录。
+- 激活后在 **worker 线程**里增量导入，主线程不被占用（实测导入期间主线程单次阻塞 ≤16ms）。
+- 只导入「修改时间在最近 N 天」的会话（设置项 `backfillDays`，默认 30）。
+- 看板顶部有进度（已导入/总数、预计剩余）与 **暂停 / 继续 / 取消**；接口全部立即返回，停止粒度到「批」。
+- 幂等：同一会话重复导入不会重复计账（`entry_key` 唯一索引）。
+- 活跃会话不断增长不会让导入「永远跑不完」：只看本批有没有净新增，无进展就指数退避（100ms → 2s → 10s → 60s → 300s）。
 
 ## 看板
 
-- 指标卡：调用数、成功率、失败/未收全、TTFT p50/p90/p99（带**样本数**与**覆盖率**）、平均延迟、`tok·s⁻¹`（**总输出 ÷ 总耗时**）、**缓存命中率**（加权，带 `n=` 样本数）、token 明细、成本（SDK 合计 + **其中估算**占比）。
-- **按模型汇总**（用户第一诉求）：每行一个模型，调用数、成功率、TTFT p50/p90、平均延迟、`tok·s⁻¹`、token、**命中率**、成本、占比；点行 = 只看该模型。`tok·s⁻¹` 与命中率的算术均值放在 tooltip 里（`均值 xx`）。
-- **价格表**面板：每个模型命中的价格行（`source:provider/model`）、四项价（USD / 1M）、候选数、失败源，以及 `priceOverrides` 写法。
-- 趋势：按小时 / 按天，两张手写 SVG 图（调用数 + TTFT p90）。
-- 记录明细：时间 / 模型 / provider / 思考档 / token / 缓存（`读/写 · 命中%`）/ 首字 / 耗时 / `tok·s⁻¹` / 成本（估算显示 `≈`）/ 状态；状态筛选、分页、点行展开拆分与来源、导出 CSV（含「缓存命中率」列）。
+- 范围：今日 / 24h / 7 天 / 30 天 / 90 天 / 全部 / 自定义；粒度 `自动 | 5m | 1h | 1d`（自动保证 ≤720 点）。
+- KPI：调用数、成功率、失败/未收全、TTFT p50/p90/p99（带覆盖率）、总耗时 p50/p90、加权 tok·s⁻¹、缓存命中率、token 合计、成本（含估算占比与缺价计数）。
+- 趋势图：调用/失败柱 + TTFT/耗时线，十字准星 tooltip（显示桶区间与口径）、图例可点隐藏系列、框选放大。
+- 排行：按模型 / 按项目 Top-N（调用数、成本、tok/s、p95）。
+- 明细表：按键分页 + 本地排序（表头会明示「仅当前页」）+ 列显隐（记住偏好），点行看 token/成本拆解。
+- 导出：服务端流式 CSV（全量，不再有 5000 行上限），末行附口径脚注。
+- 状态进 URL：`#ul?range=30d&gran=1h&model=all&status=all&view=chart`（刷新/分享后仍停在同一个视图）。
+- 顶栏真值行：`起 → 止 · N 次 · 粒度 · 数据截至 HH:MM:SS`；时区显示在 `meta.range.timezone`。
 
 ## 口径
 
-- **TTFT** = `turn_start` → 第一个流式包（`Date.now() - turnStartAt`）。**历史回填的条目没有 TTFT**：看板必须显示覆盖率，不能把「样本少」当成「很快」。
-- **成功率** = `status === "ok"` / 全部调用。`failed` = `status === "error"`；`incomplete` = 没收到 `message` 事件或会话里没有 `usage` 块（老会话 / 中断），这类记录 token 与成本不可信。
-- **`tok·s⁻¹`（主值）= 总体吞吐** = `ΣoutputTokens / (ΣdurationMs / 1000)`，只算 `durationMs > 0 && outputTokens > 0` 的调用。它回答「这段时间整体多快」。
-  - 另一个数 `tokPerSecMean` = 每次 `outputTokens / (durationMs / 1000)` 的**算术均值**（2.0 的旧口径），回答「单次调用平均多快」。长尾慢调用在总体吞吐里按耗时占比加权，所以两个数通常不相等；看板主值用总体吞吐，均值只放 tooltip。
-  - 记录表每行仍是「本条 `outputTokens / (durationMs / 1000)`」，不参与总体口径。
-- **缓存命中率** = `cacheReadTokens / promptTokens`，其中 `promptTokens = inputTokens + cacheReadTokens + cacheWriteTokens`。
-  - 汇总/按模型的主口径是**加权** `ΣcacheRead / ΣpromptTokens`；另给算术均值 `cacheHitRateMean` 与样本数 `cacheHitSamples`。
-  - 分母为 0，或该记录**根本没有缓存字段**（老会话 / live 只采到 message）→ `null`（显示 `--`），这类记录**排除出样本**，绝不算成 0%。
-- **成本**：`costUsd` 是**生效成本**——SDK `usage.cost.total > 0` 就用 SDK（`costSource: "sdk"`）；否则按价格表估算（`costSource: "estimate"`，看板显示 `≈`）；两者都无 → `null`（显示 `--`，不是 `$0`）。
-  - 每条记录都保留 `costEstimateUsd`（估算值，供对照）与 `priceId`（命中的价格行）。
-  - 汇总 `summary.cost = {amount, sdkAmount, estimatedAmount, estimateShare, pricedCalls, unpricedCalls}`，`amount = sdkAmount + estimatedAmount`，看板显示「其中估算 X%」。
-  - 估算公式：`(input*pIn + output*pOut + cacheRead*pCacheRead + cacheWrite*pCacheWrite) / 1e6`（价都是 USD / 1M token）。缺 `cacheRead` / `cacheWrite` 价 → 按 `pIn` 计，并在 `priceNote` 标 `cacheRead≈input` / `cacheWrite≈input`；**绝不把缺价当 0**。
-  - 价格行选择：`priceOverrides`（用户覆盖）→ 官方厂商行（`qwen*`→alibaba-cn/alibaba，`gemini*`→google，`grok*`→xai，`mimo*`→xiaomi，`deepseek*`→deepseek/alibaba*；匹配先剥 `provider/` 前缀与 `-high` / `-next` / `-1017` 这类变体后缀，层内按 models.dev > LiteLLM > OpenRouter 取）→ 多来源中位数 → `null`。所有候选可用 `GET /api/prices?model=` 枚举。
-
-## HTTP 接口
-
-全部 `GET` 返回 `{ ok: true, meta, … }`；出错也是 200 + `ok:false`（前端只画空态，不刷红）。
-
-| 方法与路径 | 说明 |
+| 指标 | 定义 |
 | --- | --- |
-| `GET /api/summary?window=&model=` | 指标卡 + 按模型汇总。`window` = `today` / `7d` / `30d` / `all` |
-| `GET /api/series?window=&model=&bucket=` | 趋势，`bucket` = `hour` / `day` |
-| `GET /api/records?window=&model=&status=&page=&pageSize=` | 记录明细（分页，最新在前） |
-| `GET /api/meta` | 账本规模、会话目录、上次回填（含 `coverage{imported,eligible,remaining}` 与 `importing`）、授权状态、价格表状态 |
-| `GET /api/prices?model=` | 价格候选：全部候选行（来源 / 供应商 / 四项价）+ 选中的那行；不带 `model` 时列账本里出现过的模型 |
-| `POST /api/prices/refresh` | 强制刷新价格表（失败保留旧快照，恒 200）|
-| `POST /api/backfill` | 立刻跑一次增量回填（会清掉「停止导入」标记） |
-| `POST /api/backfill/stop` | 停止自动续批导入 |
-| `POST /api/grant` | 申请 `sessions` 目录读取（宿主弹窗），成功后自动回填 |
+| `calls` | 有应答的调用数，**不含** `aborted`（用户取消）与 `incomplete`（没收到 usage 块） |
+| 成功率 | `ok / calls`（分母排除 aborted / incomplete） |
+| 状态六态 | `ok` `client_error(4xx)` `rate_limited(429)` `provider_error(5xx/超时)` `aborted` `incomplete` |
+| TTFT | `turn_start → 第一个流式包`；只有实时采集有，**看板必须显示覆盖率**，不能把「样本少」伪装成「很快」 |
+| 分位 | 直方图近似（136 桶，1ms–4h 对数等距 + 桶内插值），典型误差 <2%、最坏单桶 6.3%，UI 标 `≈` |
+| 吞吐 | `Σ output / Σ gen_ms`（加权，主值）；另给「每次中位」 |
+| 缓存命中率 | `Σ cache_read / Σ(cache_read + cache_write + 非缓存 input)`；没有缓存字段的记录**排除出样本**，不按 0% 计 |
+| 成本 | 四态：`sdk`（网关报的 `> 0`）/ `estimate`（价格表估算）/ `unpriced`（缺价，金额里排除并标「≥ 下限」）/ 未采集（四项 token 全缺）。`cost.total = 0` 归入未回填走估算——实测网关 92.5% 的行都是 0，把 0 当真值会让成本全变 0。改价不改历史（`price_id + price_version`） |
+| 时区 | 存 UTC 毫秒，展示与分桶按本地时区；看板显示实际时区 |
+
+## HTTP 接口（v3）
+
+全部 `200 + {ok:boolean}`，失败带 `code`（`no-sqlite` / `no-fs-read` / `importing` / `internal` / `request-failed`），不抛 500。
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| GET | `/api/v3/overview` | KPI + 趋势 + TopN + 覆盖度 + 价格状态（一次查询驱动整个看板） |
+| GET | `/api/v3/records` | 明细（keyset 游标分页，`limit ≤ 200`） |
+| GET | `/api/v3/record/:id` | 单条详情 |
+| GET | `/api/v3/meta` | schema/rollup 版本、状态目录、降级原因、导入器与价格状态 |
+| GET | `/api/v3/import/status` · `import/errors` | 导入进度 / 分类失败清单 |
+| POST | `/api/v3/import/start` · `pause` · `resume` · `cancel` · `recalc?day=` | 全部立即返回，后台推进 |
+| GET | `/api/v3/export?format=csv\|json` | 流式导出（带口径脚注） |
+| POST | `/api/v3/prices/refresh` | 强制刷新价格表 |
+| POST | `/api/v3/grant` | 兼容入口（3.0 起不再需要目录授权） |
+
+2.x 的 `/api/summary|series|records|meta` 已移除，前端接口与看板同版本一起替换。
 
 ## 设置项
 
-| 键 | 类型 | 默认 | 说明 |
+| key | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `sessionsDir` | text | `""` | 会话目录绝对路径，留空 = 自动解析 |
-| `backfillDays` | text | `"30"` | 回填天数（1–3650） |
-| `backfillOnStart` | boolean | `true` | 激活时立刻回填一次 |
-| `priceOverrides` | text | `""` | JSON，USD / 每 1M token，例如 `{"DeepSeek-V4-Flash-0731":{"input":0.44,"output":1.32,"cacheRead":0.088}}`；优先于一切来源 |
+| `sessionsDir` | text | 空 | 会话 JSONL 目录；空 = `$PI_CODING_AGENT_DIR/sessions` → `~/.pi/agent/sessions` |
+| `backfillDays` | text | `30` | 只导入最近 N 天有变动的会话（1–3650） |
+| `autoImport` | boolean | `true` | 是否在后台线程自动增量导入 |
+| `backfillOnStart` | boolean | `true` | 激活时立刻跑一轮导入 |
+| `priceOverrides` | text | 空 | 价格覆盖（USD / 1M token），JSON |
 
-## 与 1.0 / 2.0 的关系
+## 与 2.x 的关系
 
-2.0 不读任何代理账本（`dbPath` / `autoDiscover` / `searchRoots` 设置项与 `net` 权限已删）。2.1 把「公开价格表估算」加回来，但**只用来补 SDK 没给的成本**，且只用 `host.fetch`（不需要 `net` 权限）：SDK 给了非 0 成本时永远用 SDK。详见 [CHANGELOG](CHANGELOG.md)。
+- 3.0 是**架构重写**：存储（JSONL → SQLite）、读路径（全量扫 → 预聚合 rollup）、导入（主线程同步 → worker 线程）、客户端（整页重绘 → 差分渲染 + URL 状态）。
+- 数据不丢：`~/.pi-web/ledger.jsonl` 首次启动自动迁移，原文件保留；迁移幂等，可重复跑。
+- 完整的修复清单与实测数字见 [CHANGELOG](CHANGELOG.md)。
 
 ## 开发
 
 ```bash
-npm ci
-npm test                     # vitest：账本/会话/聚合/实时/价格表/看板 单测（全部离线）
-npm run check                # manifest 自检（字段、权限、版本、价格源白名单、残留检查）
-npm run verify:sessions -- 7 # 拿真实的 ~/.pi/agent/sessions 跑一遍只读回填，并与独立复算对照
+npx vitest run                 # 单测（v2 数据层 + v3 全部模块）
+npm run bench                  # v3 端到端基准：15 万条入库 / 各窗口聚合 / 一致性校验
+npm run check                  # manifest + 交付文件 + 依赖自检
 ```
 
-`verify-real-sessions.mjs` 的价格来源（估算成本用）：
-
-- `--prices <目录>`（默认 `.cps-tmp`）：读该目录下已下载的 `modelsdev.json` / `litellm.json` / `openrouter.json`（形状同三个公开源），**不联网**；
-- `--fetch`：现场抓三个源（慢，需要网络）；
-- 都没有：只报 SDK 成本，估算那几栏显示 `--`。
-
-脚本会打印调用数 / token / **SDK 成本 / 估算成本 / 估算占比** / 各模型**缓存命中率**。其中与参考值的偏差：**SDK 成本**做硬判定（> 2% 非 0 退出），调用数与 token 只做记录——参考值是固定的历史快照，滚动窗口会随新数据增长。
-
-脚本里的参考值来自人工独立复算（Python 直扫会话 JSONL，不经过本插件代码）：它会区分「文件覆盖不足」「批次没扫完」「去重误合并」三种归因。参考值只在 7 天窗口有效，且是**历史快照**。
-
-单测不触碰真实会话目录，也不联网：会话 fixture 与 `host.fs` 替身在 `tests/support/`，价格 fixture 在 `tests/fixtures/prices/`，`host.fetch` 一律打桩。
+接口契约（改动前必读）：[`docs/V3-CONTRACT.md`](docs/V3-CONTRACT.md)。
 
 ## 隐私
 
-- 账本与价格缓存都在本机插件数据目录；会话目录只读。
-- 出站请求只有价格表的三个固定 HTTPS 地址（`models.dev` / `raw.githubusercontent.com` / `openrouter.ai`），不携带任何用量数据，不上传任何内容。价格结果缓存 7 天，期间不再联网。
+账本、价格快照、导入状态全部写在 `<dataDir>/plugin-data/usage-ledger/`，不上传任何数据；联网只用于抓取三个公开价格表（models.dev / LiteLLM 原始 JSON / OpenRouter），请求里不含任何本地信息。
 
 ## License
 

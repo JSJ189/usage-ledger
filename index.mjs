@@ -1,65 +1,89 @@
 /**
- * usage-ledger 2.1 服务端入口
+ * usage-ledger 3.0 服务端入口。
  *
- * 记录的是 **pi-web-ui 自己的模型调用**。
+ * 职责（只做编排，不装业务）：
+ *  1. 生命周期：解析状态目录 → 打开 SQLite → 载入内存 rollup → 起导入 worker → 注册路由 → 徽标；
+ *  2. 路由 `/api/v3/*`：overview / records / record / import/* / meta / export / prices / grant；
+ *  3. 实时采集：把宿主 `onRunEvent` 折成一次调用一条记录（1 条 = 1 次同步小事务，微秒级）；
+ *  4. 降级：拿不到 `node:sqlite`、目录不可写、会话目录未授权 —— 一律 200 + `ok:false` + `code`，
+ *     绝不 500、绝不抛错，看板按 `code` 给不同文案。
  *
- * 数据两路合流：
- *  1. **实时**（`host.onRunEvent`，见 lib/live.mjs）：TTFT 只能这样拿到；
- *  2. **回填**（`~/.pi/agent/sessions/**\/*.jsonl`，见 lib/sessions.mjs）：
- *     逐轮 token、真实成本（SDK `usage.cost.total`）、单次调用耗时。
- *  两路**不是靠内容键合并**的（2.0.0 的 `ts + model + provider` 去重会把同一毫秒的多次
- *  真实调用合并成一条，2.0.1 已修）：
- *   - 回填身份 = `sessionFile + entry.id`（会话里每个 assistant 行唯一）；
- *   - live 身份 = `conversationId + turnStartAt`；
- *   - live 与回填靠 **1:1 贪心配对**合并（同 model / 同 provider / |Δts| ≤ 3s，各只能认领一次）。
- *  账本是 `host.dataDir/ledger.jsonl`（append-only，见 lib/ledger.mjs）。
- *
- * 2.1.0 新增计价：SDK 没回填成本（内网网关 `cost.total = 0`）时，按公开价格表估算，
- * 见 lib/prices.mjs。**计价发生在读取侧**（`store.query` 之后、聚合之前），账本里只存
- * SDK 原值，所以刷新价格表不需要重写账本。
- *
- * 对外路由（浏览器侧只走这些，全部 200 + `ok:false` 降级，不刷红）：
- *  - `GET  /api/summary?window=&model=`          指标卡 + 按模型汇总
- *  - `GET  /api/series?window=&model=&bucket=`    趋势（hour | day）
- *  - `GET  /api/records?window=&model=&status=&page=&pageSize=`
- *  - `GET  /api/meta`                             账本/回填/授权/覆盖率/价格表状态
- *  - `GET  /api/prices?model=`                    价格表候选（来源 / 供应商 / 四项价）
- *  - `POST /api/prices/refresh`                   强制刷新价格表（失败也不 500）
- *  - `POST /api/backfill`                         立刻跑一次增量回填（会清掉「停止」标记）
- *  - `POST /api/backfill/stop`                    停止自动续批导入
- *  - `POST /api/grant`                            申请 sessions 目录读取（宿主弹窗）
- *
- * 降级：拿不到 `fs:read` 或用户拒绝授权 → 只采 live（无 token，展示 `--`），
- * 徽标写 `仅实时`，看板给「授权并导入历史」按钮；一切都不抛错。
+ * 三条硬约束（见 docs/V3-CONTRACT.md §一）：
+ *  · 主线程禁止重活（单次同步操作 ≤16ms）；
+ *  · 热路径禁止 `host.getSettings()`（设置只在 activate / onSettingsChanged 读，之后走内存快照）；
+ *  · 读路径只读内存 rollup（明细表只服务列表/导出，且必须走索引分页）。
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createLedgerStore, LEDGER_FILE, LEDGER_SCHEMA, RECORD_STATUS } from "./lib/ledger.mjs";
-import {
-	BACKFILL_STATE_FILE,
-	createSessionImporter,
-	resolveBackfillDays,
-	resolveSessionsRoot,
-} from "./lib/sessions.mjs";
-import * as metrics from "./lib/metrics.mjs";
+import { resolveLegacyLedgerPath, resolveSessionsRoot, resolveStateDir } from "./lib/v3/paths.mjs";
+import { projectFromCwd } from "./lib/v3/parser.mjs";
+import { openStore } from "./lib/v3/store.mjs";
+import { createRollupIndex } from "./lib/v3/rollup.mjs";
+import { createPriceBook } from "./lib/v3/prices.mjs";
+import { createImporter } from "./lib/v3/importer.mjs";
 import { createLiveCollector } from "./lib/live.mjs";
-import { createPriceBook, PRICE_CACHE_FILE } from "./lib/prices.mjs";
 
-const BADGE_ID = "usage-ledger-badge";
-const DAY_MS = 86_400_000;
-/** 聚合缓存时长（账本一变就 bust；TTL 只兜「没变化时的重复请求」）。 */
-const CACHE_TTL_MS = 10_000;
-/** 徽标刷新间隔。 */
+export const BADGE_ID = "usage-ledger-badge";
+/** 徽标自检间隔（无变化不推送）。 */
 const BADGE_INTERVAL_MS = 60_000;
-/** 增量回填间隔（5 分钟；启动时另外立刻跑一次）。 */
-const BACKFILL_INTERVAL_MS = 300_000;
-/** 回填失败后的冷却，防重试风暴。 */
-const FAIL_COOLDOWN_MS = 30_000;
-/** 批次没扫完（truncated）时自动续批的间隔（brief 要求 2 秒）。 */
-const BACKFILL_CONTINUE_MS = 2000;
-/** 自动续批轮数上限（防病态情况下无限循环）。 */
-const MAX_CONTINUE_ROUNDS = 500;
+/** 增量广播节流：worker 每批都会推 delta，但浏览器最多 2 秒收一次。 */
+const BROADCAST_THROTTLE_MS = 2000;
+/** 小时桶内存保留天数（更老的走天桶）。 */
+const RETAIN_DAYS = 45;
+
+const RANGE_KEYS = ["today", "24h", "7d", "30d", "90d", "all", "custom"];
+const GRAN_KEYS = ["auto", "5m", "1h", "1d"];
+const STATUS_KEYS = ["ok", "client_error", "rate_limited", "provider_error", "aborted", "incomplete"];
+
+/** 「粒度自动」映射：保证任何范围的点数 ≤720（方案 §2.4.2）。 */
+export function autoGran(fromMs, toMs) {
+	const span = Math.max(0, toMs - fromMs);
+	const hour = 3_600_000;
+	if (span <= 26 * hour) return "5m";
+	if (span <= 40 * 24 * hour) return "1h";
+	return "1d";
+}
+
+/** 解析时间范围。`today` = 本地 00:00 起。 */
+export function resolveRange(query = {}, nowMs = Date.now()) {
+	const raw = String(query.range ?? "").trim();
+	const fromNum = Number(query.from);
+	const toNum = Number(query.to);
+	const toMs = Number.isFinite(toNum) && toNum > 0 ? toNum : nowMs;
+	if (Number.isFinite(fromNum) && fromNum > 0 && fromNum < toMs) {
+		return { key: "custom", fromMs: fromNum, toMs };
+	}
+	const day = 86_400_000;
+	const key = RANGE_KEYS.includes(raw) ? raw : "today";
+	if (key === "all") return { key, fromMs: 0, toMs };
+	if (key === "today") {
+		const d = new Date(toMs);
+		return { key, fromMs: new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime(), toMs };
+	}
+	const days = key === "24h" ? 1 : key === "7d" ? 7 : key === "30d" ? 30 : key === "90d" ? 90 : 1;
+	return { key, fromMs: toMs - days * day, toMs };
+}
+
+/** 解析筛选器：`all`/空 = 不过滤；多值用逗号。 */
+export function resolveFilters(query = {}) {
+	const pick = (v) => {
+		const s = String(v ?? "").trim();
+		if (!s || s === "all") return [];
+		return s
+			.split(",")
+			.map((x) => x.trim())
+			.filter(Boolean)
+			.slice(0, 20);
+	};
+	return {
+		model: pick(query.model),
+		provider: pick(query.provider),
+		project: pick(query.project),
+		status: pick(query.status).filter((s) => STATUS_KEYS.includes(s)),
+		q: String(query.q ?? "").trim().slice(0, 120),
+	};
+}
 
 function fmtInt(n) {
 	const v = Number(n);
@@ -73,734 +97,628 @@ function fmtMs(ms) {
 	const v = Number(ms);
 	if (!Number.isFinite(v) || v <= 0) return "--";
 	if (v < 1000) return `${Math.round(v)}ms`;
-	return `${(v / 1000).toFixed(v < 10_000 ? 1 : 0)}s`;
+	if (v < 60_000) return `${(v / 1000).toFixed(1)}s`;
+	return `${Math.round(v / 60_000)}m`;
 }
 
-/** 宿主没给 dataDir 时的兜底（仍然只写插件自己的目录，绝不写 sessions）。 */
-export function fallbackDataDir(home = homedir()) {
-	return join(home, ".pi-web-ui", "plugin-data", "usage-ledger");
-}
-
-/** 小状态文件的原子读写（回填 offset 用；写坏最多丢增量，重读即可恢复）。 */
-export function createStateStore({ dir, file, log } = {}) {
-	const path = dir ? join(dir, String(file ?? BACKFILL_STATE_FILE)) : "";
-	return {
-		path,
-		load() {
-			if (!path) return { version: 1, files: {} };
-			try {
-				if (!existsSync(path)) return { version: 1, files: {} };
-				const parsed = JSON.parse(readFileSync(path, "utf8"));
-				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { version: 1, files: {} };
-				if (!parsed.files || typeof parsed.files !== "object") parsed.files = {};
-				return parsed;
-			} catch (err) {
-				log?.("warn", "回填状态读取失败（按空状态处理）：", String(err?.message ?? err));
-				return { version: 1, files: {} };
-			}
-		},
-		save(state) {
-			if (!path) return false;
-			try {
-				mkdirSync(dir, { recursive: true });
-				const tmp = `${path}.tmp`;
-				writeFileSync(tmp, `${JSON.stringify(state)}\n`, "utf8");
-				renameSync(tmp, path);
-				return true;
-			} catch (err) {
-				log?.("warn", "回填状态写入失败（本次运行仍可用）：", String(err?.message ?? err));
-				return false;
-			}
-		},
-	};
+/** 本地时区标签（如 UTC+08:00 / Asia/Shanghai）。 */
+function timezoneInfo(now = new Date()) {
+	const offsetMin = -now.getTimezoneOffset();
+	const sign = offsetMin >= 0 ? "+" : "-";
+	const abs = Math.abs(offsetMin);
+	const hh = String(Math.floor(abs / 60)).padStart(2, "0");
+	const mm = String(abs % 60).padStart(2, "0");
+	let label = "";
+	try {
+		label = Intl.DateTimeFormat().resolvedOptions().timeZone ?? "";
+	} catch {
+		label = "";
+	}
+	return { timezone: `UTC${sign}${hh}:${mm}`, tzLabel: label };
 }
 
 /**
- * 统计服务：账本 → 聚合 → 路由信封。所有方法都不抛错（失败给 `ok:false`）。
- *
- * @param {object} options
- * @param {ReturnType<typeof createLedgerStore>} options.store
- * @param {ReturnType<typeof createSessionImporter>|null} [options.importer]
- * @param {ReturnType<typeof createPriceBook>|null} [options.prices] 价格簿（缺省 = 不估算）
- * @param {() => Record<string, unknown>} [options.getSettings]
- * @param {(level:string, ...args:unknown[])=>void} [options.log]
- * @param {() => number} [options.now]
+ * 明细行 → 合同 §5.2 的对外形状（`client/` 已按这套字段名写死）。
+ * 存储层用的是 §4.9 的落库名（`inTok/outTok/ttftMs/genMs/e2eMs`），这里做一次显式映射，
+ * 保证 HTTP 契约不随存储改名而漂移。
  */
-export function createStatsService(options = {}) {
-	const store = options.store;
-	const log = typeof options.log === "function" ? options.log : () => {};
-	const now = typeof options.now === "function" ? options.now : () => Date.now();
-	let importer = options.importer ?? null;
-	const priceBook = options.prices ?? null;
-	const liveStats = typeof options.liveStats === "function" ? options.liveStats : () => null;
-	const cache = new Map();
-	let backfillInflight = null;
-	let lastBackfill = null;
-	let backfillError = null;
-	let cooldownUntil = 0;
-	let grantState = { required: false, reason: "", reasonEn: "", hint: "", hintEn: "" };
-
-	function bust() {
-		cache.clear();
-	}
-
-	function remember(res, key, value) {
-		cache.set(key, { at: now(), value });
-		return value;
-	}
-
-	function cached(key) {
-		const hit = cache.get(key);
-		if (!hit) return null;
-		if (now() - hit.at >= CACHE_TTL_MS) {
-			cache.delete(key);
-			return null;
-		}
-		return hit.value;
-	}
-
-	function setImporter(next) {
-		importer = next ?? null;
-		bust();
-	}
-
-	/** 授权/权限类降级信息（前端据此显示「授权并导入历史」按钮）。 */
-	function setGrant(info) {
-		grantState = { required: false, reason: "", reasonEn: "", hint: "", hintEn: "", ...(info ?? {}) };
-	}
-
-	/**
-	 * 给一批记录补计价字段（新对象，绝不改账本里的原记录）。
-	 *
-	 * 性能：价格解析在价格簿里按模型记忆化，这里每条记录只做几次乘法；
-	 * 价格表本身也只在快照 / 覆盖配置变化时重建索引（brief 硬约束 8）。
-	 */
-	function priced(records) {
-		if (!priceBook || !Array.isArray(records)) return records;
-		return records.map((record) => priceBook.price(record));
-	}
-
-	function windowRecords(params = {}) {
-		const win = metrics.resolveWindow(params.window, now());
-		const model = typeof params.model === "string" ? params.model.trim() : "";
-		const all = priced(store.query({ fromMs: win.fromMs, toMs: win.toMs }));
-		const records = model ? all.filter((r) => metrics.modelKey(r) === model) : all;
-		return { win, model, records };
-	}
-
-	/**
-	 * 价格表概览（给 /api/summary 的 `prices` 字段与看板的价格面板）。
-	 * 只列本窗口出现过的模型：每个模型一条首选价 + 候选条数。
-	 */
-	function priceOverview(records) {
-		if (!priceBook) return null;
-		const seen = new Set();
-		const rows = [];
-		for (const record of records) {
-			const model = metrics.modelKey(record);
-			if (seen.has(model)) continue;
-			seen.add(model);
-			const resolved = priceBook.resolve(model);
-			const price = resolved?.price ?? null;
-			rows.push({
-				model,
-				via: resolved?.via ?? null,
-				priceId: price?.id ?? null,
-				source: price?.source ?? null,
-				provider: price?.provider ?? null,
-				input: price?.input ?? null,
-				output: price?.output ?? null,
-				cacheRead: price?.cacheRead ?? null,
-				cacheWrite: price?.cacheWrite ?? null,
-				candidates: Array.isArray(resolved?.candidates) ? resolved.candidates.length : 0,
-			});
-		}
-		rows.sort((a, b) => a.model.localeCompare(b.model));
-		return { status: priceBook.status(), models: rows };
-	}
-
-	/** 能否真正读到会话：能力在 + 目录已授权（未授权时上一次回填会把 required 置 true）。 */
-	function fsUsable() {
-		return Boolean(importer?.fsReady?.()) && !grantState.required;
-	}
-
-	function baseMeta(win, extra = {}) {
-		const backfill = importer?.summary(lastBackfill) ?? null;
-		return {
-			window: win.key,
-			fromMs: win.fromMs,
-			toMs: win.toMs,
-			generatedAt: now(),
-			ledgerPath: store.path,
-			ledger: store.stats(),
-			sessionsRoot: importer?.root ?? resolveSessionsRoot({ settings: options.getSettings?.() ?? {} }).root,
-			fsReady: fsUsable(),
-			mode: fsUsable() ? "full" : "live-only",
-			backfill,
-			// 覆盖率必须显式暴露：「看着已完成，其实只导了 1/4」是 2.0.0 的坑
-			coverage: backfill?.coverage ?? null,
-			importing: Boolean(backfill?.truncated),
-			backfillError,
-			grant: grantState,
-			live: liveStats(),
-			// 价格表状态：缺失 / 过期 / 失败源都要让用户看见（估算的可信度取决于它）
-			prices: priceBook ? priceBook.status() : null,
-			...extra,
-		};
-	}
-
-	/** 指标卡 + 按模型汇总。 */
-	function summary(params = {}) {
-		const { win, model, records } = windowRecords(params);
-		const key = `summary|${win.key}|${model}`;
-		const hit = cached(key);
-		if (hit) return { ...hit, meta: { ...hit.meta, cached: true, generatedAt: now() } };
-		const payload = {
-			ok: true,
-			meta: baseMeta(win, { model, cached: false }),
-			summary: metrics.summarize(records),
-			models: metrics.byModel(records),
-			prices: priceOverview(records),
-		};
-		return remember("summary", key, payload);
-	}
-
-	/** 趋势序列（hour | day）。 */
-	function series(params = {}) {
-		const { win, model, records } = windowRecords(params);
-		const bucket = metrics.normalizeBucket(params.bucket);
-		const key = `series|${win.key}|${model}|${bucket}`;
-		const hit = cached(key);
-		if (hit) return { ...hit, meta: { ...hit.meta, cached: true, generatedAt: now() } };
-		const payload = {
-			ok: true,
-			meta: baseMeta(win, { model, bucket, cached: false }),
-			series: metrics.series(records, { bucket }),
-		};
-		return remember("series", key, payload);
-	}
-
-	/** 记录明细（分页 + 模型/状态/关键字筛选）。 */
-	function recordsPage(params = {}) {
-		const { win, model, records } = windowRecords(params);
-		const filtered = metrics.filterRecords(records, { model, status: params.status, q: params.q });
-		const page = metrics.pageRecords(filtered, { page: params.page, pageSize: params.pageSize });
-		return {
-			ok: true,
-			meta: baseMeta(win, { model, status: metrics.normalizeStatus(params.status) }),
-			records: page.items.map(metrics.projectRecord),
-			page: page.page,
-			pages: page.pages,
-			pageSize: page.pageSize,
-			total: page.total,
-		};
-	}
-
-	/** 状态页数据（授权 / 回填 / 账本规模 / 价格表）。 */
-	function meta() {
-		return { ok: true, meta: baseMeta(metrics.resolveWindow("all", now())) };
-	}
-
-	/**
-	 * 价格表候选枚举（brief A6：`GET /api/prices?model=xxx` 返回所有候选）。
-	 *
-	 * - 带 `model`：返回该模型的全部候选行（来源 / 供应商 / 四项价）+ 选中的那行；
-	 * - 不带：列出账本里出现过的模型（最多 50 个）各一条首选价 + 候选条数，
-	 *   方便直接在设置里填 `priceOverrides`。
-	 */
-	function prices(params = {}) {
-		if (!priceBook) {
-			return { ok: false, code: "no-prices", reason: "价格表不可用", reasonEn: "Price table unavailable" };
-		}
-		const status = priceBook.status();
-		const model = typeof params.model === "string" ? params.model.trim() : "";
-		if (model) {
-			const resolved = priceBook.resolve(model);
-			return {
-				ok: true,
-				status,
-				model,
-				via: resolved.via,
-				chosen: resolved.price,
-				candidates: resolved.candidates,
-			};
-		}
-		const seen = new Set();
-		const models = [];
-		for (const record of store.list()) {
-			const key = metrics.modelKey(record);
-			if (seen.has(key)) continue;
-			seen.add(key);
-			if (models.length >= 50) break;
-			const resolved = priceBook.resolve(key);
-			models.push({
-				model: key,
-				via: resolved.via,
-				priceId: resolved.price?.id ?? null,
-				candidates: resolved.candidates.length,
-			});
-		}
-		return { ok: true, status, models };
-	}
-
-	/** 强制刷新价格表（失败保留旧快照，恒 200）。 */
-	async function refreshPrices() {
-		if (!priceBook) {
-			return { ok: false, code: "no-prices", reason: "价格表不可用", reasonEn: "Price table unavailable" };
-		}
-		const status = await priceBook.refresh();
-		priceBook.invalidate();
-		bust();
-		return { ok: status.available === true, status, meta: baseMeta(metrics.resolveWindow("all", now())) };
-	}
-
-	/** 写入一批记录（回填用）；返回写入统计。 */
-	function ingest(list) {
-		const result = store.addMany(list);
-		if (result.added || result.merged) bust();
-		return result;
-	}
-
-	/**
-	 * 跑一次增量回填。并发调用直接复用同一个 Promise（启动 + 定时 + 手动点按钮不叠加）。
-	 */
-	async function runBackfill({ force = false } = {}) {
-		if (!importer) {
-			return { ok: false, code: "no-importer", reason: "回填不可用", reasonEn: "Backfill unavailable" };
-		}
-		if (backfillInflight) return backfillInflight;
-		if (!force && cooldownUntil > now()) {
-			return { ok: false, code: "cooldown", reason: "回填冷却中", reasonEn: "Backfill cooling down" };
-		}
-		backfillInflight = (async () => {
-			try {
-				if (!importer.fsReady()) {
-					const err = {
-						code: "no-permission",
-						reason: "插件未声明 fs:read 权限",
-						reasonEn: "Plugin lacks the fs:read permission",
-						hint: "manifest.permissions 需要包含 fs:read",
-						hintEn: "manifest.permissions must include fs:read",
-					};
-					lastBackfill = { ok: false, errors: [err], records: [], files: 0 };
-					setGrant({ required: true, ...err });
-					backfillError = err;
-					return lastBackfill;
-				}
-				const result = await importer.run();
-				const written = ingest(result.records);
-				// 记录数组已经进账本，lastBackfill 只留条数（别把几万条挂在内存里）
-				lastBackfill = { ...result, records: result.records.length };
-				const firstError = (result.errors ?? [])[0] ?? null;
-				backfillError = firstError;
-				setGrant(firstError ? { required: true, ...firstError } : null);
-				if (firstError) cooldownUntil = now() + FAIL_COOLDOWN_MS;
-				if (written.added || written.merged) log("debug", `回填：+${written.added} 新记录，${written.merged} 条合并`);
-				return { ...lastBackfill, written };
-			} catch (err) {
-				const code = "backfill-failed";
-				backfillError = { code, reason: String(err?.message ?? err), reasonEn: String(err?.message ?? err) };
-				cooldownUntil = now() + FAIL_COOLDOWN_MS;
-				log("warn", "回填失败：", String(err?.message ?? err));
-				return { ok: false, code, reason: backfillError.reason, reasonEn: backfillError.reasonEn, records: [] };
-			} finally {
-				backfillInflight = null;
-			}
-		})();
-		return backfillInflight;
-	}
-
-	/** 申请 sessions 目录读取权限（宿主弹窗）。成功后立刻回填一次。 */
-	async function requestAccess({ requestFn, reason } = {}) {
-		if (typeof requestFn !== "function") return { ok: false, code: "unsupported" };
-		const root = importer?.root ?? resolveSessionsRoot({ settings: options.getSettings?.() ?? {} }).root;
-		try {
-			const granted = await requestFn(root, reason ?? "导入 pi 自己的历史模型用量（只读）");
-			if (!granted) return { ok: false, code: "denied", reason: "用户拒绝授权", reasonEn: "User declined" };
-			setGrant(null);
-			const res = await runBackfill({ force: true });
-			return { ok: true, granted: true, backfill: { ...res, records: undefined } };
-		} catch (err) {
-			return { ok: false, code: "error", reason: String(err?.message ?? err) };
-		}
-	}
-
-	/** 底栏徽标：今日调用数 / TTFT p50；没有 fs:read 时写 `仅实时`。 */
-	function badge() {
-		const win = metrics.resolveWindow("today", now());
-		const records = priced(store.query({ fromMs: win.fromMs, toMs: win.toMs }));
-		const summary = metrics.summarize(records);
-		const liveOnly = !fsUsable();
-		const backfill = importer?.summary(lastBackfill) ?? null;
-		const coverage = backfill?.coverage ?? null;
-		// 覆盖率进 tooltip：不能让用户抱着「已经导完了」的前提看数字
-		const covZh =
-			coverage && coverage.eligible > 0
-				? `，已导入 ${coverage.imported}/${coverage.eligible} 个会话文件${backfill?.truncated ? "（导入中…）" : ""}`
-				: "";
-		const covEn =
-			coverage && coverage.eligible > 0
-				? `, imported ${coverage.imported}/${coverage.eligible} session files${backfill?.truncated ? " (importing…)" : ""}`
-				: "";
-		const estimateNote =
-			summary.cost.estimatedAmount > 0 && summary.cost.estimateShare !== null
-				? `（其中估算 $${summary.cost.estimatedAmount.toFixed(4)}，占 ${(summary.cost.estimateShare * 100).toFixed(0)}%）`
-				: "";
-		const estimateNoteEn =
-			summary.cost.estimatedAmount > 0 && summary.cost.estimateShare !== null
-				? ` (estimated $${summary.cost.estimatedAmount.toFixed(4)}, ${(summary.cost.estimateShare * 100).toFixed(0)}%)`
-				: "";
-		const body = liveOnly
-			? "仅实时"
-			: `${fmtInt(summary.calls)}/${summary.ttft.p50 === null ? "--" : fmtMs(summary.ttft.p50)}`;
-		const tail = liveOnly
-			? "（没有 fs:read：只采实时事件，token 与成本为 --；点开看板可授权导入历史）"
-			: `，失败 ${summary.failed}，TTFT p50 ${summary.ttft.p50 === null ? "--" : fmtMs(summary.ttft.p50)}，平均延迟 ${summary.latencyAvg === null ? "--" : fmtMs(summary.latencyAvg)}，输出 ${fmtInt(summary.tokens.output)} tokens，成本 ${summary.cost.amount === null ? "--" : `$${summary.cost.amount.toFixed(4)}`}${estimateNote}${covZh}`;
-		return {
-			label: "用量账本",
-			badge: body,
-			hint: `📊 今日模型用量：${summary.calls} 次调用${tail}`,
-			hintEn: liveOnly
-				? "📊 Today's model usage: live-only (no fs:read; tokens and cost show --). Open the dashboard to authorize history import."
-				: `📊 Today's model usage: ${summary.calls} calls, ${summary.failed} failed, TTFT p50 ${summary.ttft.p50 === null ? "--" : fmtMs(summary.ttft.p50)}, avg latency ${summary.latencyAvg === null ? "--" : fmtMs(summary.latencyAvg)}, output ${fmtInt(summary.tokens.output)} tokens, cost ${summary.cost.amount === null ? "--" : `$${summary.cost.amount.toFixed(4)}`}${estimateNoteEn}${covEn}`,
-		};
-	}
-
+export function recordOut(r) {
+	if (!r) return null;
+	const inTok = numOrNull(r.inTok);
+	const cacheRead = numOrNull(r.cacheRead);
+	const cacheWrite = numOrNull(r.cacheWrite);
+	const promptTok = inTok === null && cacheRead === null && cacheWrite === null ? null : (inTok ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0);
+	const sdk = numOrNull(r.costSdk);
+	const est = numOrNull(r.costEst);
+	const cost = sdk !== null && sdk > 0 ? sdk : est;
+	const costSource = r.costSource ?? (sdk !== null && sdk > 0 ? "sdk" : est !== null ? "estimate" : "unpriced");
 	return {
-		summary,
-		series,
-		recordsPage,
-		meta,
-		prices,
-		refreshPrices,
-		badge,
-		ingest,
-		runBackfill,
-		requestAccess,
-		setImporter,
-		setGrant,
-		/** 账本规模/写入统计（后台任务心跳用）。 */
-		stats: () => ({ ...store.stats(), sessionsRoot: importer?.root ?? null, fsReady: fsUsable() }),
-		lastBackfill: () => importer?.summary(lastBackfill) ?? null,
-		grantState: () => grantState,
-		/** 测试/诊断用。 */
-		store,
-		get importer() {
-			return importer;
-		},
+		id: r.id ?? null,
+		ts: r.ts ?? null,
+		model: r.model ?? null,
+		provider: r.provider ?? null,
+		project: r.project ?? null,
+		status: r.status ?? null,
+		origin: r.origin ?? null,
+		sessionId: r.convId ?? r.src ?? null,
+		input: inTok,
+		output: numOrNull(r.outTok),
+		cacheRead,
+		cacheWrite,
+		reasoning: numOrNull(r.reasoningTok),
+		total: numOrNull(r.totalTok),
+		promptTok,
+		cacheHitRate: promptTok && cacheRead !== null && promptTok > 0 ? cacheRead / promptTok : null,
+		cost,
+		costSource,
+		priceId: r.priceId ?? null,
+		priceVersion: r.priceVersion ?? null,
+		ttft: numOrNull(r.ttftMs),
+		gen: numOrNull(r.genMs),
+		e2e: numOrNull(r.e2eMs),
+		stopReason: r.stopReason ?? null,
 	};
 }
 
-/** 插件入口：宿主按 `mod.default.activate(host)` 调用。 */
-export function activate(host) {
-	const settingsOf = () => {
-		try {
-			return host.getSettings?.() ?? {};
-		} catch {
-			return {};
-		}
+function numOrNull(v) {
+	const n = Number(v);
+	return Number.isFinite(n) ? n : null;
+}
+
+/** 把 v2 live 采集器的记录折成 v3 明细行（见合同 §4.9）。 */
+export function liveRowOf(rec, priceBook) {
+	const status = rec?.status === "error" ? "provider_error" : rec?.status === "incomplete" ? "incomplete" : "ok";
+	const e2e = Number(rec?.durationMs) > 0 ? Number(rec.durationMs) : null;
+	const ttft = Number(rec?.ttftMs) > 0 ? Number(rec.ttftMs) : null;
+	const gen = e2e !== null ? (ttft !== null ? Math.max(0, e2e - ttft) : e2e) : null;
+	const costSdk = Number.isFinite(Number(rec?.costUsd)) && Number(rec.costUsd) > 0 ? Number(rec.costUsd) : null;
+	const row = {
+		ts: Number(rec?.ts) || Date.now(),
+		entryKey: null,
+		convId: rec?.conversationId ?? null,
+		model: rec?.model ?? null,
+		provider: rec?.provider ?? null,
+		// 项目名与历史导入路径统一走 `projectFromCwd`：v2 的 `--C--Users-…--` 形态会被拆成另一个 refs 条目
+		project: projectFromCwd(rec?.cwd ?? rec?.projectDir, homedir()) ?? rec?.projectDir ?? null,
+		status,
+		origin: "live",
+		inTok: null,
+		outTok: null,
+		cacheRead: null,
+		cacheWrite: null,
+		reasoningTok: null,
+		totalTok: null,
+		costSdk,
+		costEst: null,
+		costSource: costSdk !== null ? "sdk" : null,
+		priceId: null,
+		priceVersion: null,
+		ttftMs: ttft,
+		genMs: gen,
+		e2eMs: e2e,
+		stopReason: rec?.stopReason ?? null,
 	};
-	const log = (level, ...args) => host.log?.(level, ...args);
-	const dataDir = typeof host.dataDir === "string" && host.dataDir ? host.dataDir : fallbackDataDir();
-
-	const store = createLedgerStore({ dir: dataDir, file: LEDGER_FILE, log });
-	store.load();
-
-	const stateStore = createStateStore({ dir: dataDir, file: BACKFILL_STATE_FILE, log });
-	const state = stateStore.load();
-
-	// ── 价格簿（2.1.0）：只读缓存，不阻塞启动；缓存缺失 / 过期才后台刷新
-	const priceBook = createPriceBook({
-		dir: dataDir,
-		fetch: typeof host.fetch === "function" ? host.fetch.bind(host) : null,
-		getSettings: settingsOf,
-		log,
-	});
-	priceBook.load();
-	log("debug", `价格缓存：${join(dataDir, PRICE_CACHE_FILE)}（${priceBook.status().entries} 行）`);
-
-	// 2.0.0 → 2.0.1 一次性账本重建：
-	// 2.0.0 拿 `ts + model + provider` 给回填记录去重，同一毫秒的多次真实调用被折叠成一条，
-	// 那些记录的 token / 成本已经不可信且无法就地修复 → 丢弃回填来源记录、清掉回填 offset
-	// 让下一次回填重新导入。live 记录保留（真实调用数靠它们），只抖掉从回填带进来的字段。
-	if (Number(state.ledgerSchema) !== LEDGER_SCHEMA) {
+	if (row.costSource === null && priceBook) {
 		try {
-			const rebuilt = store.rebuild();
-			state.files = {};
-			state.ledgerSchema = LEDGER_SCHEMA;
-			stateStore.save(state);
-			log(
-				"info",
-				`账本已重建（2.0.1 修复回填去重）：丢弃回填记录 ${rebuilt.dropped} 条，重置实时记录 ${rebuilt.reset} 条；会话文件 offset 已清零，将重新导入`,
-			);
-		} catch (err) {
-			log("warn", "账本重建失败（按原账本继续）：", String(err?.message ?? err));
+			const priced = priceBook.apply(row);
+			row.costEst = priced?.costEst ?? null;
+			row.costSource = priced?.costSource ?? "unpriced";
+			row.priceId = priced?.priceId ?? null;
+			row.priceVersion = priced?.priceVersion ?? null;
+		} catch {
+			row.costSource = "unpriced";
 		}
 	}
+	return row;
+}
 
-	const buildImporter = () => {
-		const settings = settingsOf();
-		return createSessionImporter({
-			fsApi: host.fs ?? null,
-			rootInfo: resolveSessionsRoot({ settings }),
-			settings,
-			state,
-			persist: () => stateStore.save(state),
-			log,
-			days: resolveBackfillDays(settings.backfillDays),
-		});
+/**
+ * 插件入口。宿主按 `mod.default.activate(host)` 调用。
+ * @param {object} host
+ */
+export function activate(host) {
+	const log = (level, ...args) => {
+		try {
+			host.log?.(level, ...args);
+		} catch {
+			/* 日志失败不影响主流程 */
+		}
 	};
-
-	const live = createLiveCollector({ store, log });
-	const service = createStatsService({
-		store,
-		importer: buildImporter(),
-		prices: priceBook,
-		getSettings: settingsOf,
-		log,
-		liveStats: () => live.stats(),
-	});
-
+	const dataDir = typeof host.dataDir === "string" && host.dataDir ? host.dataDir : join(homedir(), ".pi-web-ui");
 	const disposers = [];
 
-	// ── 回填自动续批：批次没扫完（truncated）时隔 2 秒再跑一批，直到扫完或用户停止
-	let continueOff = null;
-	let continueRounds = 0;
-	let continueStopped = false;
+	// ── 设置快照：只在 activate / onSettingsChanged 读一次，热路径只用内存对象
+	let settings = snapshotSettings();
+	function snapshotSettings() {
+		const raw = (() => {
+			try {
+				return host.getSettings?.() ?? {};
+			} catch {
+				return {};
+			}
+		})();
+		const days = Number(raw.backfillDays);
+		return {
+			sessionsDir: typeof raw.sessionsDir === "string" ? raw.sessionsDir : "",
+			backfillDays: Number.isFinite(days) && days > 0 ? Math.min(3650, Math.max(1, Math.trunc(days))) : 30,
+			backfillOnStart: raw.backfillOnStart !== false,
+			autoImport: raw.autoImport !== false,
+			priceOverrides: typeof raw.priceOverrides === "string" ? raw.priceOverrides : "",
+		};
+	}
 
-	function stopContinue() {
-		if (!continueOff) return;
+	// ── 状态目录（`<dataDir>/plugin-data/usage-ledger/`，用 node:fs 直写，绕开 host.fs 授权弹窗）
+	const stateDir = resolveStateDir(dataDir);
+	try {
+		mkdirSync(stateDir, { recursive: true });
+	} catch (err) {
+		log("warn", "状态目录创建失败（降级为只读实时统计）：", String(err?.message ?? err));
+	}
+	const legacyPath = resolveLegacyLedgerPath(dataDir);
+
+	// ── 存储与内存 rollup
+	const { stateDir: dbDir, store, degraded, storeError } = openStoreSafely(stateDir, log);
+	const now = Date.now();
+	const rollup = createRollupIndex({
+		rows: loadRollupRows(store, now),
+		version: readNumber(store?.metaGet?.("rollup_version"), 0),
+		// 窗口超出小时桶保留期（45 天）时 aggregate 从库加载天桶。不传 store 则 90d / all 恒为 0。
+		store,
+		log,
+	});
+
+	// ── 价格表（设置来自快照，热路径零文件读）
+	let priceBook = null;
+	try {
+		priceBook = createPriceBook({
+			dir: dbDir,
+			fetchImpl: typeof host.fetch === "function" ? host.fetch.bind(host) : globalThis.fetch,
+			getSettingsSnapshot: () => settings,
+			log,
+			now: () => Date.now(),
+		});
+		priceBook.load?.();
+	} catch (err) {
+		log("warn", "价格表初始化失败（成本只显示 SDK 值）：", String(err?.message ?? err));
+		priceBook = null;
+	}
+
+	// ── 导入器（worker 隔离；没有 store 就没有导入）
+	let importer = null;
+	if (store) {
 		try {
-			continueOff();
-		} catch {
-			/* 幂等清理 */
+			importer = createImporter({
+				host,
+				store,
+				rollup,
+				paths: {
+					stateDir: dbDir,
+					sessionsRoot: resolveSessionsRoot({ settings, home: homedir() }).root,
+					legacyPath,
+				},
+				log,
+				onDelta: (version) => {
+					scheduleBroadcast(version);
+					scheduleBadge();
+				},
+			});
+			disposers.push(host.effect?.("usage-ledger:worker", () => importer?.dispose?.()) ?? (() => importer?.dispose?.()));
+		} catch (err) {
+			log("warn", "导入器启动失败（只实时统计）：", String(err?.message ?? err));
+			importer = null;
 		}
-		continueOff = null;
 	}
 
-	/** 用户主动停止：不再续批（下次手动回填会清掉标记）。 */
-	function stopBackfill() {
-		continueStopped = true;
-		continueRounds = 0;
-		stopContinue();
-		refreshBadge();
-		return { ok: true, stopped: true };
+	// ── 实时采集：v2 采集器的语义 + v3 落库（一次调用一条，微秒级事务）
+	const live = createLiveCollector({
+		store: {
+			add(rec) {
+				if (!store) return;
+				try {
+					const row = liveRowOf(rec, priceBook);
+					const out = store.insertBatch([row], { rollupVersion: rollup.version });
+					if (out?.delta?.length) rollup.applyDelta(out.delta);
+					const version = rollup.bump();
+					store.metaSet?.("rollup_version", String(version));
+					store.metaSet?.("last_ingest_at", String(Date.now()));
+					scheduleBroadcast(version);
+					scheduleBadge();
+				} catch (err) {
+					log("warn", "实时记录写入失败：", String(err?.message ?? err));
+				}
+			},
+		},
+		log,
+	});
+	try {
+		disposers.push(host.onRunEvent?.((event) => live.handle(event)) ?? (() => {}));
+	} catch (err) {
+		log("warn", "onRunEvent 订阅失败：", String(err?.message ?? err));
 	}
 
-	function scheduleContinue() {
-		if (continueOff || continueStopped) return;
-		if (typeof host.schedule !== "function") return;
-		if (continueRounds >= MAX_CONTINUE_ROUNDS) {
-			log("warn", `回填续批已达上限 ${MAX_CONTINUE_ROUNDS} 轮，停止（下次定时或手动回填会继续）`);
+	// ── 广播节流（worker 每批都推，浏览器最多 2s 一次）
+	let broadcastTimer = null;
+	function scheduleBroadcast(version) {
+		if (broadcastTimer) return;
+		broadcastTimer = setTimeout(() => {
+			broadcastTimer = null;
+			try {
+				host.broadcast?.({ type: "usage-ledger:version", version: version ?? rollup.version });
+			} catch {
+				/* ignore */
+			}
+		}, BROADCAST_THROTTLE_MS);
+		broadcastTimer.unref?.();
+	}
+
+	// ── 徽标：只在数值变化时 `ui.update`（每次 update = 宿主全量 rescan + 全 socket 广播）
+	let badgeTimer = null;
+	let lastBadgeText = "";
+	function refreshBadge() {
+		if (!host.ui?.update) return;
+		let text = "--";
+		if (degraded) text = "不可用";
+		else {
+			try {
+				const win = resolveRange({ range: "today" });
+				const agg = rollup.aggregate({ fromMs: win.fromMs, toMs: win.toMs, gran: "5m", filters: {} });
+				const calls = agg?.kpi?.calls ?? 0;
+				const p50 = agg?.kpi?.ttft?.p50 ?? null;
+				text = calls > 0 ? `${fmtInt(calls)} · p50 ${fmtMs(p50)}` : "今日 0";
+			} catch (err) {
+				text = "--";
+			}
+		}
+		if (text === lastBadgeText) return;
+		lastBadgeText = text;
+		try {
+			host.ui.update(BADGE_ID, { badge: text });
+		} catch (err) {
+			log("warn", "徽标更新失败：", String(err?.message ?? err));
+		}
+	}
+	function scheduleBadge() {
+		if (badgeTimer) return;
+		badgeTimer = setTimeout(() => {
+			badgeTimer = null;
+			refreshBadge();
+			scheduleBadge();
+		}, BADGE_INTERVAL_MS);
+		badgeTimer.unref?.();
+	}
+	refreshBadge();
+	scheduleBadge();
+
+	// ── 路由
+	const guard = (fn) => async (req, res) => {
+		const t0 = Date.now();
+		let payload;
+		try {
+			payload = await fn(req, res);
+		} catch (err) {
+			payload = {
+				ok: false,
+				code: "internal",
+				reason: String(err?.message ?? err).slice(0, 300),
+				reasonEn: String(err?.message ?? err).slice(0, 300),
+			};
+		}
+		if (!payload || typeof payload !== "object") payload = { ok: true };
+		if (res?.headersSent) {
+			try {
+				res.end?.();
+			} catch {
+				/* 流式响应已写头，必须 end，否则浏览器挂到超时 */
+			}
 			return;
 		}
-		continueOff = host.schedule?.(
-			BACKFILL_CONTINUE_MS,
-			() => {
-				continueRounds++;
-				void (async () => {
-					const res = await syncNow();
-					if (!res?.truncated) {
-						continueRounds = 0;
-						stopContinue();
-					}
-				})();
-			},
-			{ id: "usage-ledger-backfill-continue", label: "用量账本继续导入会话文件" },
-		);
-		if (typeof continueOff === "function") {
-			// 不往 disposers 里携：自动摘除由 syncNow / stopContinue 负责，避免长跑时数组无限变长
-			log("debug", `回填续批已安排（第 ${continueRounds + 1} 轮）`);
-		} else continueOff = null;
+		try {
+			res?.setHeader?.("Cache-Control", "no-store");
+		} catch {
+			/* ignore */
+		}
+		res?.json?.(payload);
+		if (Date.now() - t0 > 200) log("warn", "慢请求：", req?.pluginPath ?? "?", `${Date.now() - t0}ms`);
+	};
+
+	const needStore = () => ({
+		ok: false,
+		code: degraded || "no-sqlite",
+		reason: degradedReason(degraded, storeError),
+	});
+
+	/** store.buildWhere 的 model 维度只认 models，不回退单数；漏映射则表格和 KPI 口径不一致。 */
+	function storeFilters(f) {
+		return { ...f, models: f.model, providers: f.provider, projects: f.project, statuses: f.status };
+	}
+	function rejectRange(query) {
+		const from = Number(query?.from);
+		const to = Number(query?.to);
+		if (Number.isFinite(from) && Number.isFinite(to) && from > 0 && to > 0 && to <= from) {
+			return { ok: false, code: "bad-range", reason: "to 必须大于 from" };
+		}
+		return null;
+	}
+	function rejectCursor(cursor) {
+		if (cursor === undefined || cursor === null || cursor === "") return null;
+		if (!/^\d+_\d+$/.test(String(cursor))) return { ok: false, code: "bad-cursor", reason: "cursor 需为 <ts>_<id>" };
+		return null;
 	}
 
-	/** 刷新底栏徽标。 */
-	function refreshBadge() {
-		try {
-			host.ui?.update?.(BADGE_ID, service.badge());
-		} catch (err) {
-			log("warn", "徽标刷新失败：", String(err?.message ?? err));
-		}
-	}
-
-	/** 回填 + 刷徽标（一切失败都只记日志）。返回本次回填统计（没有则 null）。 */
-	async function syncNow({ force = false } = {}) {
-		let res = null;
-		try {
-			res = await service.runBackfill({ force });
-		} catch (err) {
-			log("warn", "回填异常：", String(err?.message ?? err));
-		}
-		refreshBadge();
-		const summary = service.lastBackfill();
-		// 回填没真跑（未授权 / 冷却 / 无 importer）时不续批，否则会拿旧 summary 死循环
-		const skipped = !res || res.ok === false;
-		const truncated = !skipped && summary?.truncated === true;
-		// 没扫完就自己接着扫：宁可多跑几批，也不能「看着已导完」
-		if (truncated) scheduleContinue();
-		else {
-			continueRounds = 0;
-			stopContinue();
-		}
-		return { ...(res ?? {}), truncated, coverage: summary?.coverage ?? null };
-	}
-
-	// ── 实时采集
-	if (typeof host.onRunEvent === "function") {
-		try {
-			const off = host.onRunEvent((event) => {
-				try {
-					const written = live.handle(event);
-					if (written.length) refreshBadge();
-				} catch (err) {
-					log("warn", "live 事件处理失败：", String(err?.message ?? err));
-				}
+	host.route?.(
+		"GET",
+		"/api/v3/overview",
+		guard(async (req) => {
+			if (!store) return needStore();
+			const q = req?.query ?? {};
+			const win = resolveRange(q);
+			const granRaw = GRAN_KEYS.includes(String(q.gran)) ? String(q.gran) : "auto";
+			const gran = granRaw === "auto" ? autoGran(win.fromMs, win.toMs) : granRaw;
+			const bad = rejectRange(q);
+			if (bad) return bad;
+			// 迁移在 worker 里跑完后靠消息重建索引。消息丢了的话小时桶是空的，30 天窗口会显示 0。
+			if ((rollup.stats?.().hourBuckets ?? 1) === 0 && (store.stats?.().calls ?? 0) > 0) importer?.reload?.();
+			const filters = resolveFilters(q);
+			const agg = rollup.aggregate({
+				fromMs: win.fromMs,
+				toMs: win.toMs,
+				gran,
+				filters: storeFilters(filters),
+				maxBuckets: 720,
 			});
-			if (typeof off === "function") disposers.push(off);
-		} catch (err) {
-			log("warn", "onRunEvent 订阅失败（只影响实时 TTFT）：", String(err?.message ?? err));
-		}
-	}
+			return {
+				ok: true,
+				version: rollup.version,
+				range: {
+					...win,
+					// agg 可能因为桶数上限升粒度：以它回显的实际粒度为准（客户端要按这个画 x 轴）
+					gran: agg.range?.gran ?? agg.gran ?? gran,
+					granRequested: gran,
+					granAuto: granRaw === "auto",
+					granDowngraded: Boolean(agg.range?.granDowngraded ?? agg.granDowngraded),
+					truncated: Boolean(agg.range?.truncated ?? agg.truncated),
+					...timezoneInfo(),
+				},
+				freshness: freshnessOf(),
+				kpi: agg.kpi,
+				series: agg.series,
+				topModels: agg.topModels,
+				topProjects: agg.topProjects,
+				filters: agg.filters ?? refFilters(),
+				prices: priceStatus(),
+			};
+		}),
+	);
 
-	// ── 路由（全部 200 + ok:false 降级）
-	const send = (res, payload) => {
-		try {
-			res.status?.(200);
-			res.json(payload);
-		} catch (err) {
-			log("warn", "路由应答失败：", String(err?.message ?? err));
-		}
-	};
-	/** 回填结果瘦身：记录数组换成条数（路由应答不该塞几千条记录）。 */
-	const slim = (res) => {
-		if (!res || typeof res !== "object") return null;
-		const { records, ...rest } = res;
-		return { ...rest, records: Array.isArray(records) ? records.length : Number(records) || 0 };
-	};
-	const guard = (fn) => async (req, res) => {
-		try {
-			send(res, await fn(req));
-		} catch (err) {
-			send(res, { ok: false, code: "internal", reason: String(err?.message ?? err) });
-		}
-	};
+	host.route?.(
+		"GET",
+		"/api/v3/records",
+		guard(async (req) => {
+			if (!store) return needStore();
+			const q = req?.query ?? {};
+			const bad = rejectRange(q) || rejectCursor(q.cursor);
+			if (bad) return bad;
+			const win = resolveRange(q);
+			const filters = storeFilters(resolveFilters(q));
+			const limit = Math.min(200, Math.max(1, Math.trunc(Number(q.limit) || 50)));
+			const out = store.queryRecords({ fromMs: win.fromMs, toMs: win.toMs, filters, cursor: q.cursor, limit, q: q.q });
+			if (out?.ok === false) return { ok: false, code: out.code, reason: out.hint ?? "查询被拒绝", total: out.total ?? 0 };
+			return { ok: true, total: out.total, records: (out.items ?? []).map(recordOut), nextCursor: out.nextCursor };
+		}),
+	);
 
-	if (typeof host.route === "function") {
-		host.route("GET", "/api/summary", guard((req) => service.summary(req?.query ?? {})));
-		host.route("GET", "/api/series", guard((req) => service.series(req?.query ?? {})));
-		host.route("GET", "/api/records", guard((req) => service.recordsPage(req?.query ?? {})));
-		host.route("GET", "/api/meta", guard(() => service.meta()));
-		host.route(
+	host.route?.(
+		"GET",
+		"/api/v3/record/*",
+		guard(async (req) => {
+			if (!store) return needStore();
+			const sub = String(req?.pluginPath ?? "").replace(/^\/api\/v3\/record\/?/, "");
+			const id = Number(sub);
+			const rec = Number.isFinite(id) ? store.getRecordById(id) : null;
+			if (!rec) return { ok: false, code: "not-found", reason: "记录不存在" };
+			return { ok: true, record: recordOut(rec) };
+		}),
+	);
+
+	host.route?.(
+		"GET",
+		"/api/v3/meta",
+		guard(async () => ({
+			ok: true,
+			meta: {
+				schemaVersion: 3,
+				rollupVersion: rollup.version,
+				stateDir: dbDir,
+				legacyLedger: existsSync(legacyPath),
+				ledgerBytes: safeSize(join(dbDir, "ledger.sqlite")),
+				sessionsRoot: resolveSessionsRoot({ settings, home: homedir() }).root,
+				degraded: degraded ? { code: degraded, reason: degradedReason(degraded, storeError) } : null,
+				settings,
+				importer: importer?.status?.() ?? null,
+				prices: priceStatus(),
+				store: store?.stats?.() ?? null,
+			},
+		})),
+	);
+
+	host.route?.("GET", "/api/v3/import/status", guard(async () => ({ ok: true, status: importer?.status?.() ?? idleStatus() })));
+	host.route?.("GET", "/api/v3/import/errors", guard(async () => ({ ok: true, errors: importer?.errors?.() ?? [] })));
+	for (const [verb, method] of [
+		["start", "start"],
+		["pause", "pause"],
+		["resume", "resume"],
+		["cancel", "cancel"],
+	]) {
+		host.route?.(
 			"POST",
-			"/api/backfill",
+			`/api/v3/import/${verb}`,
 			guard(async () => {
-				// 手动回填 = 从头续上（清掉「停止导入」标记）
-				continueStopped = false;
-				const res = await syncNow({ force: true });
-				return { ok: res.ok !== false, backfill: slim(res), meta: service.meta().meta };
+				if (!importer) return { ok: false, code: "no-importer", reason: "导入器不可用（缺少存储或会话授权）" };
+				importer[method]?.();
+				return { ok: true, status: importer.status?.() ?? idleStatus() };
 			}),
 		);
-		host.route("POST", "/api/backfill/stop", guard(() => ({ ...stopBackfill(), meta: service.meta().meta })));
-		host.route("GET", "/api/prices", guard((req) => service.prices(req?.query ?? {})));
-		// 刷新失败也只能 200 + ok:false（失败源记在 status.sources[].ok）
-		host.route("POST", "/api/prices/refresh", guard(() => service.refreshPrices()));
-		host.route(
-			"POST",
-			"/api/grant",
-			guard(async () => {
-				const out = await service.requestAccess({ requestFn: host.fs?.requestAccess });
-				refreshBadge();
-				continueStopped = false;
-				if (service.lastBackfill()?.truncated) scheduleContinue();
-				return { ...out, backfill: slim(out.backfill), meta: service.meta().meta };
-			}),
-		);
+	}
+	host.route?.(
+		"POST",
+		"/api/v3/import/recalc",
+		guard(async (req) => {
+			if (!importer) return { ok: false, code: "no-importer", reason: "导入器不可用" };
+			const day = String(req?.query?.day ?? "").slice(0, 10);
+			if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return { ok: false, code: "bad-day", reason: "day 需为 YYYY-MM-DD" };
+			importer.recalcDay?.(day);
+			return { ok: true, day };
+		}),
+	);
+
+	host.route?.(
+		"POST",
+		"/api/v3/prices/refresh",
+		guard(async () => {
+			if (!priceBook) return { ok: false, code: "no-prices", reason: "价格表不可用" };
+			const status = await priceBook.refresh();
+			return { ok: true, prices: status };
+		}),
+	);
+
+	host.route?.(
+		"GET",
+		"/api/v3/export",
+		guard(async (req, res) => {
+			if (!store) return needStore();
+			const q = req?.query ?? {};
+			const bad = rejectRange(q);
+			if (bad) return bad;
+			const win = resolveRange(q);
+			const filters = storeFilters(resolveFilters(q));
+			const format = String(q.format ?? "csv").toLowerCase() === "json" ? "json" : "csv";
+			const header =
+				format === "csv"
+					? "\uFEFFtime,model,provider,project,status,origin,input,output,cacheRead,cacheWrite,total,promptTok,cacheHitRate,cost,costSource,ttft_ms,gen_ms,e2e_ms,stopReason,sessionId\n"
+					: "";
+			res?.setHeader?.("Content-Type", format === "csv" ? "text/csv; charset=utf-8" : "application/json; charset=utf-8");
+			res?.setHeader?.("Content-Disposition", `attachment; filename="usage-ledger-${win.key}.${format}"`);
+			res?.write?.(format === "csv" ? header : '{"records":[');
+			let cursor = "";
+			let first = true;
+			let written = 0;
+			for (;;) {
+				const page = store.queryRecords({ fromMs: win.fromMs, toMs: win.toMs, filters, cursor, limit: 200 });
+				if (!page.items.length) break;
+				let chunk = "";
+				for (const r of page.items) {
+					const view = recordOut(r);
+					if (format === "csv") chunk += `${csvRow(view)}\n`;
+					else chunk += `${first ? "" : ","}${JSON.stringify(view)}`;
+					first = false;
+					written++;
+				}
+				res?.write?.(chunk);
+				if (!page.nextCursor || page.items.length < 200) break;
+				cursor = page.nextCursor;
+				// 让出事件循环，别把主线程按住
+				await new Promise((r) => setImmediate(r));
+			}
+			if (format === "csv") {
+				res?.write?.(`\n# 口径：时区 ${timezoneInfo().timezone} · 范围 ${win.key} · 粒度自动 · 导出 ${written} 条 · 成本含 SDK 与估算（见 costSource）\n`);
+			} else {
+				res?.write?.("]}");
+			}
+			res?.end?.();
+			return null; // 已经自己写过响应，guard 不要再 json()
+		}),
+	);
+
+	host.route?.(
+		"POST",
+		"/api/v3/grant",
+		guard(async () => {
+			try {
+				const out = await host.fs?.requestAccess?.();
+				if (importer) importer.resume?.();
+				return { ok: true, grant: out ?? null };
+			} catch (err) {
+				return { ok: false, code: "grant-failed", reason: String(err?.message ?? err) };
+			}
+		}),
+	);
+
+	// ── 设置变化：重建快照、重建导入器根目录、价目表失效
+	try {
+		const off = host.onSettingsChanged?.(() => {
+			settings = snapshotSettings();
+			priceBook?.invalidate?.();
+			try {
+				priceBook?.ensureFresh?.();
+			} catch {
+				/* ignore */
+			}
+			if (importer?.setSessionsRoot) {
+				importer.setSessionsRoot(resolveSessionsRoot({ settings, home: homedir() }).root);
+			}
+			refreshBadge();
+		});
+		if (typeof off === "function") disposers.push(off);
+	} catch (err) {
+		log("warn", "onSettingsChanged 订阅失败：", String(err?.message ?? err));
 	}
 
-	// ── 定时：徽标 60s、增量回填 5 分钟
+	// ── 价格表后台刷新（缓存缺失/过期才联网；失败只记日志）
 	try {
-		const offBadge = host.schedule?.(
-			BADGE_INTERVAL_MS,
-			() => {
-				refreshBadge();
-			},
-			{ id: "usage-ledger-badge", label: "用量账本徽标刷新" },
-		);
-		if (typeof offBadge === "function") disposers.push(offBadge);
+		priceBook?.ensureFresh?.();
 	} catch (err) {
-		log("warn", "徽标定时任务注册失败：", String(err?.message ?? err));
-	}
-	try {
-		const offBackfill = host.schedule?.(
-			BACKFILL_INTERVAL_MS,
-			() => {
-				void syncNow();
-			},
-			{ id: "usage-ledger-backfill", label: "用量账本会话回填" },
-		);
-		if (typeof offBackfill === "function") disposers.push(offBackfill);
-	} catch (err) {
-		log("warn", "回填定时任务注册失败：", String(err?.message ?? err));
+		log("warn", "价格表刷新调度失败：", String(err?.message ?? err));
 	}
 
-	// ── 后台任务心跳（状态可见，不刷 console）
+	// ── 启动导入：先迁移 v2 账本，再增量导入（都在 worker 里，不阻塞主线程）
+	if (importer) {
+		(async () => {
+			try {
+				// 迁移与「自动导入」开关无关：它是历史数据的一次性搬运，不做就等于丢账
+				if (existsSync(legacyPath) && !store.metaGet?.("migrated_at")) {
+					log("info", "检测到 v2 账本，开始迁移（后台）");
+					await importer.migrateLegacy?.();
+				}
+			} catch (err) {
+				log("warn", "v2 迁移失败（不阻塞增量导入）：", String(err?.message ?? err));
+			}
+			if (settings.autoImport && settings.backfillOnStart) importer.start?.();
+		})();
+	}
+
+	// ── 后台任务心跳（面板可见，不当调度器）
 	let bgTask = null;
 	try {
 		bgTask = host.registerBackgroundTask?.({
 			id: "usage-ledger",
-			label: "用量账本（模型调用记录）",
-			status: "待首次回填",
-			intervalMs: 5 * 60_000,
+			label: "用量账本（v3）",
+			status: degraded ? `降级：${degraded}` : "待命",
+			intervalMs: 60_000,
 			check: () => {
-				const st = service.stats();
-				const backfill = service.lastBackfill();
-				if (!st.fsReady) return { alive: true, status: `仅实时（无 fs:read） · 账本 ${st.records} 条` };
-				const last = backfill?.finishedAt ? new Date(backfill.finishedAt).toISOString().slice(11, 19) : "未跑";
-				const cov = backfill?.coverage ?? null;
-				const covText = cov ? ` · 会话文件 ${cov.imported}/${cov.eligible}${backfill?.truncated ? "（导入中…）" : ""}` : "";
-				return { alive: true, status: `账本 ${st.records} 条 · 上次回填 ${last}${covText}` };
+				const st = importer?.status?.() ?? idleStatus();
+				const stats = store?.stats?.() ?? { calls: 0 };
+				const phase = st.phase ?? "idle";
+				const status = degraded
+					? `降级：${degraded} · ${fmtInt(stats.calls)} 条`
+					: `${phase} · ${fmtInt(stats.calls)} 条 · 已导入 ${st.filesDone ?? 0}/${st.filesTotal ?? 0}`;
+				return { alive: true, status };
 			},
 		});
 	} catch (err) {
 		log("warn", "registerBackgroundTask 失败：", String(err?.message ?? err));
 	}
 
-	// ── 设置变化：sessionsDir / backfillDays 都可能变 → 重建回填器再跑一次
-	if (typeof host.onSettingsChanged === "function") {
-		try {
-			const off = host.onSettingsChanged(() => {
-				service.setImporter(buildImporter());
-				// priceOverrides 可能改了：清记忆化并按需刷新价格表
-				priceBook.invalidate();
-				void priceBook.ensureFresh();
-				void syncNow({ force: true });
-			});
-			if (typeof off === "function") disposers.push(off);
-		} catch (err) {
-			log("warn", "onSettingsChanged 订阅失败：", String(err?.message ?? err));
-		}
-	}
-
-	// 启动：先出徽标（本地账本，无需授权），再后台跑一次增量回填
-	refreshBadge();
-	// 价格表：缓存缺失 / 过期才联网（TTL 7 天）；失败只记日志，不影响看板
-	try {
-		priceBook.ensureFresh();
-	} catch (err) {
-		log("warn", "价格表刷新调度失败：", String(err?.message ?? err));
-	}
-	const settingsAtBoot = settingsOf();
-	if (settingsAtBoot.backfillOnStart !== false) {
-		void syncNow({ force: true });
-	}
-
+	// ── 收尾
 	return () => {
-		stopContinue();
+		if (broadcastTimer) clearTimeout(broadcastTimer);
+		if (badgeTimer) clearTimeout(badgeTimer);
+		broadcastTimer = null;
+		badgeTimer = null;
 		for (const off of disposers.splice(0)) {
 			try {
 				off();
 			} catch {
-				/* 幂等清理：单条失败不影响其余 */
+				/* 幂等清理 */
 			}
 		}
 		try {
@@ -808,10 +726,146 @@ export function activate(host) {
 		} catch {
 			/* ignore */
 		}
-		live.reset();
+		try {
+			live.reset();
+		} catch {
+			/* ignore */
+		}
+		try {
+			store?.close?.();
+		} catch {
+			/* ignore */
+		}
 	};
+
+	// ────────────────────────────────────────────── 内部工具
+
+	function openStoreSafely(dir, logFn) {
+		try {
+			const s = openStore({ dir, readOnly: false, log: logFn });
+			return { stateDir: dir, store: s, degraded: null, storeError: null };
+		} catch (err) {
+			const message = String(err?.message ?? err);
+			const code = /not found|Cannot find|ERR_UNKNOWN_BUILTIN|sqlite/i.test(message) ? "no-sqlite" : "no-store";
+			logFn("warn", "存储初始化失败（降级为无统计）：", message);
+			return { stateDir: dir, store: null, degraded: code, storeError: message };
+		}
+	}
+
+	function loadRollupRows(s, nowMs) {
+		if (!s) return [];
+		const rows = [];
+		try {
+			const hourRows = s.rollupRows({ fromMs: nowMs - RETAIN_DAYS * 86_400_000, toMs: nowMs, gran: "hour" });
+			for (const r of hourRows) rows.push(r);
+		} catch (err) {
+			log("warn", "小时桶载入失败：", String(err?.message ?? err));
+		}
+		return rows;
+	}
+
+	function readNumber(v, fallback) {
+		const n = Number(v);
+		return Number.isFinite(n) ? n : fallback;
+	}
+
+	function refFilters() {
+		try {
+			return {
+				models: store?.refList?.("model") ?? [],
+				providers: store?.refList?.("provider") ?? [],
+				projects: store?.refList?.("project") ?? [],
+				statuses: STATUS_KEYS,
+			};
+		} catch {
+			return { models: [], providers: [], projects: [], statuses: STATUS_KEYS };
+		}
+	}
+
+	function freshnessOf() {
+		const st = importer?.status?.() ?? idleStatus();
+		const stats = (() => {
+			try {
+				return store?.stats?.() ?? { calls: 0 };
+			} catch {
+				return { calls: 0 };
+			}
+		})();
+		return {
+			lastIngestAt: readNumber(store?.metaGet?.("last_ingest_at"), null),
+			lastImportAt: st.finishedAt ?? null,
+			ledgerRecords: stats.calls ?? 0,
+			importing: st.phase === "importing" || st.phase === "scanning",
+			coverage: { imported: st.filesDone ?? 0, eligible: st.filesTotal ?? 0 },
+			degraded: degraded ? { code: degraded, reason: degradedReason(degraded, storeError) } : null,
+		};
+	}
+
+	function priceStatus() {
+		try {
+			const s = priceBook?.status?.() ?? null;
+			return s
+				? {
+						version: priceBook?.version ?? null,
+						fetchedAt: s.fetchedAt ?? null,
+						stale: s.stale === true,
+						entries: s.entries ?? 0,
+						overridesError: s.overridesError ?? null,
+						failed: s.failed ?? [],
+					}
+				: null;
+		} catch {
+			return null;
+		}
+	}
+
+	function idleStatus() {
+		return { phase: "idle", filesTotal: 0, filesDone: 0, rowsTotal: 0, bytesRead: 0, etaMs: null, lastError: null, startedAt: null, finishedAt: null, workerAlive: false };
+	}
+}
+
+function degradedReason(code, detail) {
+	if (code === "no-sqlite") return "当前 Node 不支持内置 node:sqlite（需 Node ≥22.5），统计不可用";
+	return `存储不可用：${String(detail ?? "").slice(0, 200)}`;
+}
+
+function safeSize(path) {
+	try {
+		return statSync(path).size;
+	} catch {
+		return 0;
+	}
+}
+
+function csvCell(v) {
+	if (v === null || v === undefined) return "";
+	const s = String(v);
+	return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function csvRow(r) {
+	return [
+		new Date(Number(r.ts) || 0).toISOString(),
+		csvCell(r.model),
+		csvCell(r.provider),
+		csvCell(r.project),
+		r.status,
+		r.origin,
+		r.input ?? "",
+		r.output ?? "",
+		r.cacheRead ?? "",
+		r.cacheWrite ?? "",
+		r.total ?? "",
+		r.promptTok ?? "",
+		r.cacheHitRate ?? "",
+		r.cost ?? "",
+		r.costSource ?? "",
+		r.ttft ?? "",
+		r.gen ?? "",
+		r.e2e ?? "",
+		csvCell(r.stopReason),
+		csvCell(r.sessionId),
+	].join(",");
 }
 
 export default { activate };
-/** 便于单测/诊断的再导出。 */
-export { DAY_MS, CACHE_TTL_MS, BADGE_INTERVAL_MS, BACKFILL_INTERVAL_MS, RECORD_STATUS, metrics, PRICE_CACHE_FILE };

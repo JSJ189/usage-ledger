@@ -1,8 +1,8 @@
 {
   "name": "pi-web-ui-plugin-usage-ledger",
-  "version": "2.1.1",
+  "version": "3.0.0",
   "private": false,
-  "description": "pi-web-ui 界面插件：记录 pi-web-ui 自己的每次模型调用（按模型统计 TTFT / 延迟 / 吞吐 / 缓存命中率 / token / 成本，缺价按公开价格表估算）",
+  "description": "pi-web-ui 界面插件：记录 pi-web-ui 自己的每次模型调用（预聚合 rollup + SQLite，范围切换毫秒级；历史会话在 worker 线程导入，可暂停/继续），按模型统计 TTFT / 延迟 / 吞吐 / 缓存命中率 / token / 成本，缺价按公开价格表估算",
   "license": "MIT",
   "author": "JSJ189",
   "homepage": "https://github.com/JSJ189/usage-ledger",
@@ -27,12 +27,12 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=22.13"
+    "node": ">=22.5"
   },
   "scripts": {
     "test": "vitest run",
     "check": "node scripts/check-manifest.mjs",
-    "verify:sessions": "node scripts/verify-real-sessions.mjs"
+    "bench": "node scripts/v3-bench.mjs"
   },
   "devDependencies": {
     "jsdom": "^30.1.0",

@@ -141,6 +141,24 @@ const REQUIRED_FILES = [
 	"lib/metrics.mjs",
 	"lib/live.mjs",
 	"lib/prices.mjs",
+	"lib/v3/paths.mjs",
+	"lib/v3/schema.mjs",
+	"lib/v3/hist.mjs",
+	"lib/v3/metrics.mjs",
+	"lib/v3/store.mjs",
+	"lib/v3/rollup.mjs",
+	"lib/v3/parser.mjs",
+	"lib/v3/ingest.mjs",
+	"lib/v3/ingest-worker.mjs",
+	"lib/v3/importer.mjs",
+	"lib/v3/migrate.mjs",
+	"lib/v3/prices.mjs",
+	"client/state.mjs",
+	"client/dom.mjs",
+	"client/format.mjs",
+	"client/dict.mjs",
+	"client/layout.mjs",
+	"client/charts.mjs",
 	"manifest.json",
 ];
 for (const rel of REQUIRED_FILES) {
@@ -160,7 +178,7 @@ for (const rel of REMOVED_FILES) {
 	}
 }
 // 源码里不得再出现只读 SQLite / 代理账本的痕迹（价格源只允许出现在 lib/prices.mjs）
-const BANNED_IN_SOURCE = [/node:sqlite/, /usage_events/, /EasyCLIProxyAPI/];
+const BANNED_IN_SOURCE = [/usage_events/, /EasyCLIProxyAPI/];
 /** 允许外部 HTTPS 的来源白名单（只有价格表模块能引用）。 */
 const PRICE_HOSTS = ["models.dev", "raw.githubusercontent.com", "openrouter.ai"];
 const SKIP_DIRS = new Set(["node_modules", ".git", "coverage", ".cps-tmp", "docs"]);
@@ -181,7 +199,7 @@ const walkSource = (dir) => {
 		}
 		// 价格源主机只允许 lib/prices.mjs 引用（manifest 的描述文案除外，那是给用户看的说明）
 		const isManifest = entry.name === "manifest.json";
-		if (!isManifest && !rel.endsWith(join("lib", "prices.mjs"))) {
+		if (!isManifest && !rel.endsWith(join("lib", "prices.mjs")) && !rel.endsWith(join("lib", "v3", "prices.mjs"))) {
 			for (const host of PRICE_HOSTS) {
 				if (body.includes(host)) fail(`${rel} 引用了价格源主机 ${host}（只允许 lib/prices.mjs）`);
 			}

@@ -1,1548 +1,1544 @@
 /**
- * usage-ledger 2.0 客户端看板
+ * usage-ledger v3 · 客户端看板（入口）
  *
- * 职责：
- *  1. 底栏徽标（bottombar 槽位）点击 → 切到本插件视图（走宿主 setView，不碰宿主 DOM）；
- *  2. 视图内渲染看板：指标卡（调用次数/成功率/失败+未收全/TTFT p50·p90·p99/平均延迟/
- *     平均 tok·s⁻¹/token 合计/真实成本）、按模型汇总表（点行 = 只看该模型）、
- *     按小时或按天趋势双图、记录明细表（分页 + 状态筛选 + 点开去重明细）；
- *  3. 数据源全是 pi-web-ui 自己：实时运行事件（TTFT）+ 会话 JSONL（token/真实成本/耗时）。
- *     不读任何代理账本、不抓价目表、不估算成本。
- *  4. 图表手写 SVG，零外部 CDN、零新增依赖；样式全在插件自己的 <style> 里，前缀 cps-。
- *
- * 数字口径（与 lib/metrics.mjs / README 一致）：
- *  - `TTFT` = turn_start → 第一个流式包；**只能实时采集**，回填的历史条目没有 TTFT，
- *    所以看板必须显示 TTFT 覆盖率，不能把「样本少」伪装成「很快」；
- *  - `tok/s` 主值 = **总输出 ÷ 总耗时**（ΣoutputTokens ÷ ΣdurationMs/1000）；
- *    单次均值为 `tokPerSecMean`，只放在 tooltip 里（两个数不一样，不能混用）；
- *  - `缓存命中率` = cacheRead ÷ (input + cacheRead + cacheWrite)，主值加权；
- *    没有缓存字段的记录（老会话 / live）**排除出样本**，不算 0%；
- *  - `成本` = SDK `usage.cost.total`（有且 > 0）优先，否则按价格表估算（`≈` 前缀）；
- *    指标卡同时显示「其中估算」占比；两者都无 → `--`；
- *  - 失败 = `status: "error"`；`incomplete` = 事件没收到 message 或会话没有 usage。
+ * 目标（docs/V3-CONTRACT.md §六 + 方案 §2.6）：
+ *  1. 首屏只发 2 个请求：`/api/v3/overview` 与 `/api/v3/import/status`；
+ *     明细分页只在切到表格视图或滚到底部时才发；
+ *  2. 骨架只建一次，之后按 `data-k` 打补丁（无整页 innerHTML，刷新不丢滚动/焦点）；
+ *  3. 四态齐备：loading（骨架）/ ready / stale（保留旧数据 + banner）/ error（按 code 分文案）；
+ *  4. 每次请求带 `AbortSignal.timeout(8000)` + 请求代数守卫；切范围立刻高亮 + 骨架，不清旧数据；
+ *  5. 顶栏真值行：`起 → 止 · N 次 · 粒度 · 数据截至 HH:MM:SS`；
+ *  6. URL 只写非默认值（`#ul?range=30d&gran=1h&view=chart`），用 `replaceState` 不增历史；
+ *  7. 图表手写 SVG（crosshair + 单一 tooltip + 图例隐藏系列 + KPI sparkline）；
+ *  8. 明细表光标分页 + 当前页排序 + 列显隐持久化（`cps.` 前缀）+ 本地时区时间；
+ *  9. 导入面板进度条 + pause/resume/cancel，运行中 2s 轮询、空闲 30s；
+ * 10. 导出直接调服务端流式接口；中/英字典单源；分段控件 tablist + aria-sort 等 a11y。
  */
-// 独立仓库：不引 `@pi-web-ui/plugin-sdk/client`（浏览器里是裸 ESM，解析不到宿主别名），
-// 把用到的两个纯函数内联在这里，语义与 plugin-sdk/client-utils.mjs 完全一致。
 
-/** HTML 转义（同 SDK：& < > " '）。 */
-function esc(s) {
-	return String(s ?? "").replace(
-		/[&<>"']/g,
-		(c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c],
-	);
-}
+import { dict, detectLang } from "./dict.mjs";
+import * as F from "./format.mjs";
+import { h, patch, pool, clear, setText } from "./dom.mjs";
+import { ensureStyles, buildSkeleton, KPI_CARDS } from "./layout.mjs";
+import { createChart, createSparkline } from "./charts.mjs";
+import {
+	RANGES,
+	GRANS,
+	VIEWS,
+	HASH_PREFIX,
+	STATUSES,
+	COLUMNS,
+	COLUMN_KEYS,
+	apiParams,
+	activeFilterCount,
+	buildHash,
+	cloneQuery,
+	createState,
+	filterList,
+	parseHash,
+	querySig,
+	readStore,
+	toggleFilter,
+	writeStore,
+} from "./state.mjs";
 
-/** 插件 API 前缀（同 SDK：/plugins-api/<pluginId>）。 */
-function sharedApiBase(pluginId) {
-	return `/plugins-api/${pluginId}`;
-}
-
+const PLUGIN_ID = "usage-ledger";
 const ACTION_OPEN = "usage-ledger:open";
 const VIEW_NAME = "plugin:usage-ledger";
-const STYLE_ID = "usage-ledger-styles";
-const REFRESH_MS = 60_000;
-const PAGE_SIZE = 20;
+/** 单次请求超时（合同 §六）。 */
+const TIMEOUT_MS = 8000;
+const POLL_VISIBLE_MS = 60_000;
+const POLL_HIDDEN_MS = 30_000;
+const POLL_IMPORT_RUNNING_MS = 2_000;
+const POLL_IMPORT_IDLE_MS = 30_000;
+const NOTICE_MS = 6000;
+const TABLE_SIZES = [50, 100, 200];
+const LS_HIDDEN_COLS = "table.hiddenCols";
 
-// ──────────────────────────────────────────────────────────── 文案
+const IMPORT_RUNNING = new Set(["scanning", "importing", "paused"]);
 
-const ZH = {
-	cacheHitRate: "缓存命中率",
-	costEstimate: "其中估算",
-	costSdk: "SDK 成本",
-	tokpsNote: "总输出 ÷ 总耗时",
-	tokpsMean: "均值",
-	cacheHitNote: "Σ缓存读 ÷ Σ提示词 token",
-	pricesTable: "价格表（估算依据）",
-	priceModel: "模型",
-	priceChosen: "生效价格",
-	priceVia: "选取",
-	priceCandidates: "候选",
-	priceNone: "该模型在价格表里没有可用价格（显示 --）",
-	priceStatus: "价格表",
-	priceStale: "已过期",
-	priceNever: "未抓取",
-	priceRefresh: "刷新价格表",
-	priceOverrideHint:
-		"多来源差异大时，用设置项 priceOverrides 覆盖（USD / 1M token）：{\"模型名\":{\"input\":0.44,\"output\":1.32,\"cacheRead\":0.088}}",
-	viaOverride: "用户覆盖",
-	viaOfficial: "官方行",
-	viaMedian: "多源中位",
-	costSourceSdk: "SDK",
-	costSourceEstimate: "估算",
-	costSourceNone: "无价",
-	kvEstimate: "估算成本",
-	kvPriceId: "价格行",
-	kvCacheHit: "命中率",
-	title: "用量账本",
-	subtitle: "pi-web-ui 自己的每次模型调用（TTFT 只实时采集）",
-	win: { today: "今日", "7d": "7 天", "30d": "30 天", all: "全部" },
-	bucket: { hour: "按小时", day: "按天" },
-	refresh: "刷新",
-	backfill: "回填",
-	loading: "加载中…",
-	calls: "调用次数",
-	successRate: "成功率",
-	failedIncomplete: "失败 / 未收全",
-	ttftP50: "TTFT p50",
-	ttftP90: "TTFT p90",
-	ttftP99: "TTFT p99",
-	latencyAvg: "平均延迟",
-	tokPerSec: "平均 tok·s⁻¹",
-	tokensTotal: "token 合计",
-	cost: "成本",
-	costNote: "SDK usage.cost.total（缺价按价格表估算）",
-	tokensIn: "输入",
-	tokensOut: "输出",
-	cacheRead: "缓存读",
-	cacheWrite: "缓存写",
-	reasoning: "思考",
-	samples: "样本",
-	ttftCoverage: "TTFT 覆盖",
-	modelsCount: "模型",
-	chartCalls: "按时间 · 调用次数",
-	chartTtft: "按时间 · TTFT 分位",
-	modelsTable: "按模型汇总",
-	recordsTable: "记录明细",
-	thModel: "模型",
-	thCalls: "调用",
-	thSuccess: "成功率",
-	thTtftP50: "TTFT p50",
-	thTtftP90: "TTFT p90",
-	thLatency: "平均延迟",
-	thTokps: "tok·s⁻¹",
-	thTokens: "token 合计",
-	thCost: "成本",
-	thShare: "占比",
-	thTime: "时间",
-	thProvider: "provider",
-	thThinking: "思考",
-	thCache: "缓存读/写",
-	thCacheHit: "命中率",
-	thTtft: "首字",
-	thDuration: "耗时",
-	thStatus: "状态",
-	thSource: "来源",
-	thDetail: "拆分明细",
-	statusOk: "成功",
-	statusFailed: "失败",
-	statusIncomplete: "未收全",
-	statusAll: "全部",
-	sourceLive: "实时",
-	sourceBackfill: "回填",
-	sourceBoth: "实时+回填",
-	legendCalls: "调用",
-	legendFailed: "失败",
-	legendP50: "p50",
-	legendP90: "p90",
-	noSamples: "该窗口没有实时 TTFT 样本",
-	empty: "还没有记录。跑一次对话，或授予 sessions 目录读取以导入历史。",
-	emptyWindow: "该窗口没有记录，换个时间窗试试。",
-	ttftNote:
-		"TTFT 只能实时采集：历史回填的条目没有首字时间（不影响 token / 真实成本 / 延迟）。覆盖率 = 有 TTFT 的调用 / 全部调用。",
-	liveOnly: "仅实时：没有 fs:read，token 与成本显示 --",
-	grant: "授权并导入历史",
-	grantHint: "读取 ~/.pi/agent/sessions（只读）以导入历史用量，插件绝不写那里。",
-	backfillOk: "回填完成",
-	backfillFail: "回填失败",
-	noticeTitle: "读不到用量",
-	retry: "重试",
-	modelFilter: "只看",
-	clearFilter: "看全部模型",
-	page: (a, b) => `第 ${a} / ${b} 页`,
-	prev: "上一页",
-	next: "下一页",
-	total: "共",
-	rows: "条",
-	colSettings: "显示设置",
-	exportCsv: "导出筛选结果 CSV",
-	exportHint: "导出当前筛选条件（模型 / 状态 / 时间窗口）下的记录，上限 5000 行",
-	exportDone: (n) => `已导出 ${n} 行`,
-	exportCapped: "已达 5000 行上限，请缩小筛选范围后再导出",
-	rowsPerPage: " 条/页",
-	ledger: "账本",
-	sessionsRoot: "会话目录",
-	lastBackfill: "上次回填",
-	never: "未跑过",
-	fileCoverage: "已导入",
-	sessionFiles: "个会话文件",
-	importing: "导入中…",
-	stopImport: "停止导入",
-	files: "文件",
-	stopped: "停止原因",
-	unknown: "(未知)",
-	trace: "会话",
-	kvIn: "输入",
-	kvOut: "输出",
-	kvReasoning: "推理",
-	kvCacheRead: "缓存读",
-	kvCacheWrite: "缓存写",
-	kvTotal: "合计",
-	id: "记录 id",
-};
+const CHART_CALLS_SERIES = [
+	{ key: "ok", labelKey: "legendOk", tone: "accent" },
+	{ key: "error", labelKey: "legendError", tone: "red" },
+	{ key: "incomplete", labelKey: "legendIncomplete", tone: "amber" },
+	{ key: "other", labelKey: "legendOther", tone: "faint" },
+];
+const CHART_LATENCY_SERIES = [
+	{ key: "ttftP50", labelKey: "legendTtftP50", tone: "accent" },
+	{ key: "ttftP90", labelKey: "legendTtftP90", tone: "amber", dash: true },
+	{ key: "e2eP50", labelKey: "legendE2eP50", tone: "green" },
+];
 
-const EN = {
-	cacheHitRate: "Cache hit rate",
-	costEstimate: "Estimated",
-	costSdk: "SDK cost",
-	tokpsNote: "total output ÷ total time",
-	tokpsMean: "mean",
-	cacheHitNote: "Σ cache read ÷ Σ prompt tokens",
-	pricesTable: "Price table (estimation basis)",
-	priceModel: "Model",
-	priceChosen: "Effective price",
-	priceVia: "Picked by",
-	priceCandidates: "Candidates",
-	priceNone: "No usable price for this model (shows --)",
-	priceStatus: "Price table",
-	priceStale: "stale",
-	priceNever: "never fetched",
-	priceRefresh: "Refresh prices",
-	priceOverrideHint:
-		"When sources disagree, override via settings `priceOverrides` (USD / 1M tokens): {\"model\":{\"input\":0.44,\"output\":1.32,\"cacheRead\":0.088}}",
-	viaOverride: "user override",
-	viaOfficial: "official row",
-	viaMedian: "multi-source median",
-	costSourceSdk: "SDK",
-	costSourceEstimate: "estimated",
-	costSourceNone: "unpriced",
-	kvEstimate: "estimated cost",
-	kvPriceId: "price row",
-	kvCacheHit: "hit rate",
-	title: "Usage Ledger",
-	subtitle: "pi-web-ui's own model calls (TTFT is live-only)",
-	win: { today: "Today", "7d": "7 days", "30d": "30 days", all: "All" },
-	bucket: { hour: "Hourly", day: "Daily" },
-	refresh: "Refresh",
-	backfill: "Backfill",
-	loading: "Loading…",
-	calls: "Calls",
-	successRate: "Success rate",
-	failedIncomplete: "Failed / incomplete",
-	ttftP50: "TTFT p50",
-	ttftP90: "TTFT p90",
-	ttftP99: "TTFT p99",
-	latencyAvg: "Avg latency",
-	tokPerSec: "Avg tok·s⁻¹",
-	tokensTotal: "Tokens",
-	cost: "Cost",
-	costNote: "SDK usage.cost.total (missing → price table)",
-	tokensIn: "input",
-	tokensOut: "output",
-	cacheRead: "cache read",
-	cacheWrite: "cache write",
-	reasoning: "reasoning",
-	samples: "samples",
-	ttftCoverage: "TTFT coverage",
-	modelsCount: "models",
-	chartCalls: "Calls over time",
-	chartTtft: "TTFT percentiles over time",
-	modelsTable: "By model",
-	recordsTable: "Call records",
-	thModel: "Model",
-	thCalls: "Calls",
-	thSuccess: "Success",
-	thTtftP50: "TTFT p50",
-	thTtftP90: "TTFT p90",
-	thLatency: "Avg latency",
-	thTokps: "tok·s⁻¹",
-	thTokens: "Tokens",
-	thCost: "Cost",
-	thShare: "Share",
-	thTime: "Time",
-	thProvider: "provider",
-	thThinking: "thinking",
-	thCache: "cache r/w",
-	thCacheHit: "hit rate",
-	thTtft: "first token",
-	thDuration: "duration",
-	thStatus: "Status",
-	thSource: "Source",
-	thDetail: "Breakdown",
-	statusOk: "ok",
-	statusFailed: "failed",
-	statusIncomplete: "incomplete",
-	statusAll: "all",
-	sourceLive: "live",
-	sourceBackfill: "backfill",
-	sourceBoth: "live+backfill",
-	legendCalls: "calls",
-	legendFailed: "failed",
-	legendP50: "p50",
-	legendP90: "p90",
-	noSamples: "No live TTFT samples in this window",
-	empty: "No records yet. Run a conversation, or authorize the sessions directory to import history.",
-	emptyWindow: "No records in this window; try another range.",
-	ttftNote:
-		"TTFT can only be captured live: backfilled records have no first-token time (tokens, cost and latency are unaffected). Coverage = calls with TTFT / all calls.",
-	liveOnly: "Live only: no fs:read, tokens and cost show --",
-	grant: "Authorize & import history",
-	grantHint: "Reads ~/.pi/agent/sessions (read-only) to import past usage; the plugin never writes there.",
-	backfillOk: "Backfill done",
-	backfillFail: "Backfill failed",
-	noticeTitle: "Cannot read usage",
-	retry: "Retry",
-	modelFilter: "Only",
-	clearFilter: "All models",
-	page: (a, b) => `Page ${a} / ${b}`,
-	prev: "Prev",
-	next: "Next",
-	total: "Total",
-	rows: "rows",
-	colSettings: "Columns",
-	exportCsv: "Export filtered CSV",
-	exportHint: "Export records under the current filter (model / status / window), capped at 5000 rows",
-	exportDone: (n) => `Exported ${n} rows`,
-	exportCapped: "Hit the 5000-row cap; narrow the filter before exporting",
-	rowsPerPage: " / page",
-	ledger: "Ledger",
-	sessionsRoot: "Sessions",
-	lastBackfill: "Last backfill",
-	never: "never",
-	fileCoverage: "Imported",
-	sessionFiles: "session files",
-	importing: "importing…",
-	stopImport: "Stop importing",
-	files: "files",
-	stopped: "stop reason",
-	unknown: "(unknown)",
-	trace: "session",
-	kvIn: "input",
-	kvOut: "output",
-	kvReasoning: "reasoning",
-	kvCacheRead: "cache read",
-	kvCacheWrite: "cache write",
-	kvTotal: "total",
-	id: "record id",
-};
-
-function detectLang() {
-	try {
-		const lang = String(document.documentElement.lang || "").toLowerCase();
-		if (lang.startsWith("zh")) return "zh";
-		if (lang) return "en";
-	} catch {
-		/* 极老浏览器：走回落 */
-	}
-	try {
-		return String(navigator.language || "")
-			.toLowerCase()
-			.startsWith("zh")
-			? "zh"
-			: "en";
-	} catch {
-		return "zh";
-	}
-}
-
-export function dict(lang) {
-	return lang === "en" ? EN : ZH;
-}
-
-// ──────────────────────────────────────────────────────────── 格式化
-
-function fmtInt(n) {
-	const v = Number(n);
-	if (!Number.isFinite(v)) return "--";
-	if (Math.abs(v) >= 1_000_000_000) return `${(v / 1_000_000_000).toFixed(2)}B`;
-	if (Math.abs(v) >= 1_000_000) return `${(v / 1_000_000).toFixed(2)}M`;
-	if (Math.abs(v) >= 1_000) return `${(v / 1_000).toFixed(1)}k`;
-	return String(Math.round(v));
-}
-
-export function fmtMs(ms) {
-	const v = Number(ms);
-	if (!Number.isFinite(v) || v <= 0) return "--";
-	if (v < 1000) return `${Math.round(v)}ms`;
-	if (v < 60_000) return `${(v / 1000).toFixed(v < 10_000 ? 2 : 1)}s`;
-	return `${Math.floor(v / 60_000)}m${String(Math.round((v % 60_000) / 1000)).padStart(2, "0")}s`;
-}
-
-/** 坐标轴刻度：0 也是有效刻度，不能像 fmtMs 那样回落 "--"。 */
-function fmtAxisMs(ms) {
-	const v = Number(ms);
-	if (!Number.isFinite(v)) return "--";
-	if (v === 0) return "0";
-	return fmtMs(v);
-}
-
-function fmtRate(x) {
-	if (x === null || x === undefined) return "--";
-	const v = Number(x);
-	if (!Number.isFinite(v)) return "--";
-	return `${(v * 100).toFixed(1)}%`;
-}
-
-export function fmtShare(x) {
-	const v = Number(x);
-	if (x === null || x === undefined || !Number.isFinite(v)) return "--";
-	return `${(v * 100).toFixed(v > 0 && v < 0.01 ? 2 : 1)}%`;
-}
-
-function fmtTokps(x) {
-	if (x === null || x === undefined) return "--";
-	const v = Number(x);
-	if (!Number.isFinite(v) || v < 0) return "--";
-	return v.toFixed(v < 10 ? 2 : 0);
-}
-
-/** USD / 1M token 的价格（价格表面板用）。null → `--`（没查到，不是 0）。 */
-function fmtPrice(x) {
-	if (x === null || x === undefined) return "--";
-	const v = Number(x);
-	if (!Number.isFinite(v)) return "--";
-	if (v === 0) return "0";
-	if (v < 0.01) return v.toFixed(6);
-	if (v < 1) return v.toFixed(4);
-	return v.toFixed(2);
-}
-
-/** 成本来源标签（SDK 真实 / 价格表估算 / 没价）。 */
-function costSourceLabel(source, d) {
-	if (source === "sdk") return d.costSourceSdk;
-	if (source === "estimate") return d.costSourceEstimate;
-	return d.costSourceNone;
-}
-
-/** 真实成本（USD）。没有成本字段 → `--`（不是 $0）。估算值前面加 `≈`。 */
-export function fmtCost(amount, source) {
-	const v = Number(amount);
-	if (amount === null || amount === undefined || !Number.isFinite(v)) return "--";
-	const body = `$${v.toFixed(v < 1 ? 4 : 2)}`;
-	return source === "estimate" ? `≈${body}` : body;
-}
-
-function fmtHour(hour, _lang) {
-	// 服务端下发的是本地时间键：小时 `YYYY-MM-DDTHH:00:00` 或天 `YYYY-MM-DD`
-	const s = String(hour ?? "");
-	const m = s.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2})/);
-	if (m) return `${m[2]}-${m[3]} ${m[4]}:00`;
-	const d = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-	if (d) return `${d[2]}-${d[3]}`;
-	return s;
-}
-
-function fmtTime(ts) {
-	const v = Number(ts);
-	if (!Number.isFinite(v) || v <= 0) return "--";
-	const d = new Date(v);
-	const p2 = (n) => String(n).padStart(2, "0");
-	return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
-}
-
-function apiBase() {
-	return sharedApiBase("usage-ledger");
-}
-
-// ──────────────────────────────────────────────────────────── 样式
-
-function ensureStyles() {
-	if (typeof document === "undefined") return;
-	if (document.getElementById(STYLE_ID)) return;
-	const style = document.createElement("style");
-	style.id = STYLE_ID;
-	style.textContent = `
-		.cps-root {
-			display: flex; flex-direction: column; gap: 12px;
-			padding: 14px 16px 24px; height: 100%; overflow: auto;
-			overscroll-behavior: contain;
-			color: var(--text, #e6e8ef); background: var(--bg, #14161d);
-			font-size: 13px; line-height: 1.5;
-			min-width: 0; max-width: 100%;
-		}
-		.cps-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
-		.cps-title { font-size: 15px; font-weight: 600; }
-		.cps-sub { color: var(--text-dim, #8b90a0); font-size: 12px; min-width: 0; overflow-wrap: anywhere; }
-		.cps-spacer { flex: 1 1 auto; }
-		.cps-seg { display: inline-flex; border: 1px solid var(--border, #2a2e3a); border-radius: 8px; overflow: hidden; }
-		.cps-seg button {
-			background: transparent; color: var(--text-dim, #8b90a0); border: 0; cursor: pointer;
-			padding: 4px 10px; font-size: 12px; font-family: inherit;
-		}
-		.cps-seg button.on { background: var(--accent, #7c5cff); color: var(--accent-contrast, #fff); }
-		.cps-btn {
-			background: var(--bg-elev2, #1a1d26); color: var(--text, #e6e8ef);
-			border: 1px solid var(--border, #2a2e3a); border-radius: 8px;
-			padding: 4px 10px; font-size: 12px; cursor: pointer; font-family: inherit;
-		}
-		.cps-btn:hover { border-color: var(--accent, #7c5cff); }
-		.cps-btn:disabled { opacity: 0.55; cursor: default; }
-		.cps-btn.primary { border-color: var(--accent, #7c5cff); color: var(--accent, #7c5cff); }
-		.cps-cards { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); }
-		.cps-card {
-			background: var(--bg-elev2, #1a1d26); border: 1px solid var(--border, #2a2e3a);
-			border-radius: 10px; padding: 10px 12px; min-width: 0;
-		}
-		.cps-card .k { color: var(--text-dim, #8b90a0); font-size: 11.5px; }
-		.cps-card .v { font-size: 18px; font-weight: 600; margin-top: 2px; overflow-wrap: anywhere; }
-		.cps-card .n { color: var(--text-faint, #6b7080); font-size: 11px; margin-top: 2px; }
-		.cps-panel {
-			background: var(--bg-elev2, #1a1d26); border: 1px solid var(--border, #2a2e3a);
-			border-radius: 10px; padding: 10px 12px; min-width: 0;
-		}
-		.cps-panel > h3 { margin: 0 0 8px; font-size: 12.5px; font-weight: 600; color: var(--text-dim, #8b90a0); }
-		.cps-hint { color: var(--text-faint, #6b7080); font-size: 11.5px; margin-top: 6px; overflow-wrap: anywhere; }
-		.cps-legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 11.5px; color: var(--text-faint, #6b7080); margin-top: 4px; }
-		.cps-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
-		.cps-svg { display: block; width: 100%; height: auto; overflow: visible; }
-		.cps-grid2 { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
-		.cps-tbl-wrap { overflow-x: auto; min-width: 0; }
-		.cps-tbl { width: 100%; border-collapse: collapse; font-size: 12px; }
-		.cps-tbl th, .cps-tbl td {
-			text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--border, #2a2e3a);
-			white-space: nowrap;
-		}
-		.cps-tbl th:first-child, .cps-tbl td:first-child { text-align: left; }
-		.cps-tbl th { color: var(--text-dim, #8b90a0); font-weight: 500; font-size: 11.5px; }
-		.cps-tbl tbody tr[data-model], .cps-tbl tbody tr[data-rid] { cursor: pointer; }
-		.cps-tbl tbody tr:hover { background: color-mix(in srgb, var(--accent, #7c5cff) 10%, transparent); }
-		.cps-tbl td.mono { font-variant-numeric: tabular-nums; }
-		.cps-detail td {
-			text-align: left; color: var(--text-dim, #8b90a0); background: color-mix(in srgb, var(--accent, #7c5cff) 6%, transparent);
-			white-space: normal; overflow-wrap: anywhere;
-		}
-		.cps-detail b { color: var(--text, #e6e8ef); font-weight: 600; }
-		.cps-badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; }
-		.cps-badge.ok { background: color-mix(in srgb, var(--green, #10b981) 22%, transparent); color: var(--green, #10b981); }
-		.cps-badge.bad { background: color-mix(in srgb, var(--red, #ef4444) 22%, transparent); color: var(--red, #ef4444); }
-		.cps-badge.cancel { background: color-mix(in srgb, var(--amber, #f59e0b) 22%, transparent); color: var(--amber, #f59e0b); }
-		.cps-badge.multi { background: color-mix(in srgb, var(--amber, #f59e0b) 14%, transparent); color: var(--amber, #f59e0b); font-weight: 500; margin-left: 5px; }
-		.cps-tools {
-			display: flex;
-			flex-wrap: wrap;
-			gap: 6px 14px;
-			padding: 8px 10px;
-			margin-top: 6px;
-			border: 1px solid var(--border, #2a2e3a);
-			border-radius: 8px;
-			font-size: 12px;
-		}
-		.cps-col {
-			display: inline-flex;
-			align-items: center;
-			gap: 4px;
-			color: var(--text-dim, #8b90a0);
-			cursor: pointer;
-		}
-		.cps-sel {
-			background: transparent;
-			color: inherit;
-			border: 1px solid var(--border, #2a2e3a);
-			border-radius: 6px;
-			font-size: 12px;
-			padding: 2px 4px;
-		}
-		.cps-notice {
-			border: 1px solid color-mix(in srgb, var(--amber, #f59e0b) 45%, transparent);
-			background: color-mix(in srgb, var(--amber, #f59e0b) 12%, transparent);
-			border-radius: 10px; padding: 12px; font-size: 12.5px;
-		}
-		.cps-notice h3 { margin: 0 0 6px; font-size: 13px; }
-		.cps-notice p { margin: 4px 0; color: var(--text-dim, #8b90a0); overflow-wrap: anywhere; }
-		.cps-notice code { font-size: 11.5px; overflow-wrap: anywhere; }
-		.cps-notice .cps-tried { margin: 6px 0; font-size: 11.5px; }
-		.cps-notice .cps-tried summary { cursor: pointer; color: var(--text-dim, #8b90a0); }
-		.cps-notice .cps-tried ul { margin: 4px 0 0; padding-left: 16px; max-height: 160px; overflow: auto; }
-		.cps-notice .cps-tried li { color: var(--text-faint, #6b7080); overflow-wrap: anywhere; }
-		.cps-empty { color: var(--text-faint, #6b7080); text-align: center; padding: 18px 0; font-size: 12.5px; }
-		.cps-meta { color: var(--text-faint, #6b7080); font-size: 11.5px; overflow-wrap: anywhere; }
-		.cps-meta code { font-size: 11.5px; }
-		.cps-filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-		.cps-chip {
-			display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 999px;
-			border: 1px solid color-mix(in srgb, var(--accent, #7c5cff) 45%, transparent);
-			color: var(--accent, #7c5cff); font-size: 11.5px; cursor: pointer; background: transparent; font-family: inherit;
-		}
-		.cps-pager { display: flex; align-items: center; gap: 8px; justify-content: flex-end; font-size: 11.5px; color: var(--text-faint, #6b7080); }
-		.cps-c-red { color: var(--red, #ef4444); }
-		.cps-c-amber { color: var(--amber, #f59e0b); }
-		.cps-c-dim { color: var(--text-dim, #8b90a0); }
-	`;
-	document.head.appendChild(style);
-}
-
-// ──────────────────────────────────────────────────────────── SVG 图表
-
-const CHART_W = 760;
-const CHART_H = 150;
-const PAD_L = 42;
-const PAD_R = 10;
-const PAD_T = 12;
-const PAD_B = 22;
-
-/** 线性映射：值 → y 像素（y 轴向下）。 */
-function yOf(value, max) {
-	const inner = CHART_H - PAD_T - PAD_B;
-	const safeMax = max > 0 ? max : 1;
-	return PAD_T + inner - (value / safeMax) * inner;
-}
-
-/** 空数据占位 SVG。 */
-function emptyChart(text) {
-	return `<div class="cps-empty">${esc(text)}</div>`;
-}
-
-/**
- * 请求数柱状图（失败/取消部分叠色）。
- * @param {Array<{hour: string, calls: number, bad: number}>} hours
- */
-export function callsChart(hours, d) {
-	if (!hours.length) return emptyChart(d.empty);
-	const max = Math.max(...hours.map((h) => Number(h.calls) || 0), 1);
-	const inner = CHART_W - PAD_L - PAD_R;
-	const step = inner / hours.length;
-	const barW = Math.max(2, Math.min(22, step * 0.72));
-	const parts = [];
-	// y 轴网格
-	for (const ratio of [0, 0.5, 1]) {
-		const y = yOf(max * ratio, max);
-		parts.push(
-			`<line x1="${PAD_L}" y1="${y.toFixed(1)}" x2="${CHART_W - PAD_R}" y2="${y.toFixed(1)}" stroke="var(--border, #2a2e3a)" stroke-dasharray="3 4" stroke-width="1"/>`,
-		);
-		parts.push(
-			`<text x="${PAD_L - 6}" y="${(y + 3.5).toFixed(1)}" font-size="10" fill="var(--text-faint, #6b7080)" text-anchor="end">${esc(fmtInt(max * ratio))}</text>`,
-		);
-	}
-	hours.forEach((h, i) => {
-		const calls = Number(h.calls) || 0;
-		const bad = Math.min(Number(h.bad) || 0, calls);
-		const good = calls - bad;
-		const x = PAD_L + i * step + (step - barW) / 2;
-		const bottom = yOf(0, max);
-		// 整条柱（成功 + 失败）从 0 线往上长：y 取「成功部分」的顶，高度到 0 线为止
-		const yGoodTop = yOf(good, max);
-		parts.push(
-			`<rect x="${x.toFixed(1)}" y="${yGoodTop.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(0, bottom - yGoodTop).toFixed(1)}" fill="var(--accent, #7c5cff)" opacity="0.85" rx="1"><title>${esc(`${fmtHour(h.hour)} · ${d.legendCalls} ${calls} / ${d.legendFailed} ${bad}`)}</title></rect>`,
-		);
-		if (bad > 0) {
-			// 失败/取消段叠在柱顶：从柱子顶部往下 bad 那么多，永不越过 0 线
-			const yTop = yOf(calls, max);
-			parts.push(
-				`<rect x="${x.toFixed(1)}" y="${yTop.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(1, yGoodTop - yTop).toFixed(1)}" fill="var(--red, #ef4444)" opacity="0.9" rx="1"><title>${esc(`${fmtHour(h.hour)} · ${d.legendFailed} ${bad}`)}</title></rect>`,
-			);
-		}
-	});
-	// x 轴首末标签
-	const labelIdx = hours.length > 1 ? [0, hours.length - 1] : [0];
-	for (const i of labelIdx) {
-		const x = PAD_L + i * step + step / 2;
-		parts.push(
-			`<text x="${x.toFixed(1)}" y="${CHART_H - 6}" font-size="10" fill="var(--text-faint, #6b7080)" text-anchor="${i === 0 ? "start" : "end"}">${esc(fmtHour(hours[i].hour))}</text>`,
-		);
-	}
-	return `<svg class="cps-svg" viewBox="0 0 ${CHART_W} ${CHART_H}" role="img">${parts.join("")}</svg>`;
-}
-
-/**
- * TTFT 分位折线图（p50 / p90，毫秒）。
- * @param {Array<{hour: string, ttftP50: number|null, ttftP90: number|null}>} hours
- */
-export function ttftChart(hours, d) {
-	const usable = hours.filter((h) => Number(h.ttftP90) > 0 || Number(h.ttftP50) > 0);
-	if (!usable.length) return emptyChart(d.noSamples);
-	const max = Math.max(...usable.map((h) => Math.max(Number(h.ttftP90) || 0, Number(h.ttftP50) || 0)), 1);
-	const inner = CHART_W - PAD_L - PAD_R;
-	const step = hours.length > 1 ? inner / (hours.length - 1) : 0;
-	const parts = [];
-	for (const ratio of [0, 0.5, 1]) {
-		const y = yOf(max * ratio, max);
-		parts.push(
-			`<line x1="${PAD_L}" y1="${y.toFixed(1)}" x2="${CHART_W - PAD_R}" y2="${y.toFixed(1)}" stroke="var(--border, #2a2e3a)" stroke-dasharray="3 4" stroke-width="1"/>`,
-		);
-		parts.push(
-			`<text x="${PAD_L - 6}" y="${(y + 3.5).toFixed(1)}" font-size="10" fill="var(--text-faint, #6b7080)" text-anchor="end">${esc(fmtAxisMs(max * ratio))}</text>`,
-		);
-	}
-	const line = (key, color) => {
-		const pts = [];
-		hours.forEach((h, i) => {
-			const v = Number(h[key]);
-			if (!Number.isFinite(v) || v <= 0) return;
-			pts.push(`${(PAD_L + i * step).toFixed(1)},${yOf(v, max).toFixed(1)}`);
-		});
-		if (!pts.length) return "";
-		const dots = pts
-			.map((p) => {
-				const [x, y] = p.split(",");
-				return `<circle cx="${x}" cy="${y}" r="2.2" fill="${color}"/>`;
-			})
-			.join("");
-		return `<polyline fill="none" stroke="${color}" stroke-width="1.8" points="${pts.join(" ")}"/>${dots}`;
-	};
-	parts.push(line("ttftP90", "var(--amber, #f59e0b)"));
-	parts.push(line("ttftP50", "var(--accent, #7c5cff)"));
-	const labelIdx = hours.length > 1 ? [0, hours.length - 1] : [0];
-	for (const i of labelIdx) {
-		const x = hours.length > 1 ? PAD_L + i * step : PAD_L;
-		parts.push(
-			`<text x="${x.toFixed(1)}" y="${CHART_H - 6}" font-size="10" fill="var(--text-faint, #6b7080)" text-anchor="${i === 0 ? "start" : "end"}">${esc(fmtHour(hours[i].hour))}</text>`,
-		);
-	}
-	return `<svg class="cps-svg" viewBox="0 0 ${CHART_W} ${CHART_H}" role="img">${parts.join("")}</svg>`;
-}
-
-function legend(items) {
-	return `<div class="cps-legend">${items
-		.map((it) => `<span><i style="background:${it.color}"></i>${esc(it.label)}</span>`)
-		.join("")}</div>`;
-}
-
-// ──────────────────────────────────────────────────────────── 渲染
-
-function card(label, value, note, title, valueHtml) {
-	return `<div class="cps-card"${title ? ` title="${esc(title)}"` : ""}><div class="k">${esc(label)}</div><div class="v">${valueHtml ?? esc(value)}</div>${
-		note ? `<div class="n">${esc(note)}</div>` : ""
-	}</div>`;
-}
-
-/** 指标卡组。`s` = /api/summary 的 summary；`d` = 文案。 */
-export function renderCards(s, d) {
-	if (!s) return "";
-	const calls = Number(s.calls) || 0;
-	const ttft = s.ttft ?? { samples: 0, p50: null, p90: null, p99: null, coverage: null };
-	const tokens = s.tokens ?? {};
-	const cost = s.cost ?? { amount: null, unpricedCalls: 0, totalCalls: 0 };
-	const tokNote = `${s.tokPerSecSamples ?? 0} ${d.samples}`;
-	const tokenNote = `${d.tokensIn} ${fmtInt(tokens.input)} · ${d.tokensOut} ${fmtInt(tokens.output)} · ${d.cacheRead} ${fmtInt(tokens.cacheRead)} · ${d.cacheWrite} ${fmtInt(tokens.cacheWrite)} · ${d.reasoning} ${fmtInt(tokens.reasoning)}`;
-	const estimated = Number(cost.estimatedAmount) || 0;
-	const estimateShare = cost.estimateShare === null || cost.estimateShare === undefined ? null : Number(cost.estimateShare);
-	const costNote =
-		cost.amount === null
-			? `${d.costNote} · ${d.samples} 0`
-			: `${d.costNote}${estimated > 0 && estimateShare !== null ? ` · ${d.costEstimate} ${fmtShare(estimateShare)}` : ""}${cost.unpricedCalls ? ` · -- ${cost.unpricedCalls}` : ""}`;
-	const costTitle =
-		cost.amount === null
-			? `${d.costSdk} + ${d.costSourceEstimate}：本窗口没有任何可用价格`
-			: `${d.costSdk} ${fmtCost(cost.sdkAmount ?? null)} + ${d.costSourceEstimate} ${fmtCost(estimated, "estimate")}（占比 ${estimateShare === null ? "--" : fmtShare(estimateShare)}）；共 ${cost.pricedCalls ?? 0} 次有价 / ${cost.unpricedCalls ?? 0} 次无价`;
-	const cacheNote = `${d.samples} ${s.cacheHitSamples ?? 0}`;
-	const cacheTitle = `${d.cacheHitNote}；加权 ${fmtRate(s.cacheHitRate)}，${d.tokpsMean} ${fmtRate(s.cacheHitRateMean)}（${s.cacheHitSamples ?? 0} 次调用有缓存字段）`;
-	return `<div class="cps-cards">
-		${card(d.calls, fmtInt(calls), `${s.models ?? 0} ${d.modelsCount}`, `调用次数：${calls}`)}
-		${card(d.successRate, fmtRate(s.successRate), `${d.statusOk} ${s.ok ?? 0}`, `成功率 = 成功 / 全部调用（${s.ok ?? 0}/${calls}）`)}
-		${card(
-			d.failedIncomplete,
-			`${fmtInt(s.failed ?? 0)} / ${fmtInt(s.incomplete ?? 0)}`,
-			`${d.statusFailed} / ${d.statusIncomplete}`,
-			`失败（status=error）与未收全（缺 message 或 usage）分开计数`,
-		)}
-		${card(d.ttftP50, ttft.p50 === null ? "--" : fmtMs(ttft.p50), `${d.samples} ${ttft.samples ?? 0}`, `首字时间 p50（只统计实时采集的调用）`)}
-		${card(d.ttftP90, ttft.p90 === null ? "--" : fmtMs(ttft.p90), ttft.coverage === null ? "" : `${d.ttftCoverage} ${fmtRate(ttft.coverage)}`, `首字时间 p90`)}
-		${card(d.ttftP99, ttft.p99 === null ? "--" : fmtMs(ttft.p99), `${d.samples} ${ttft.samples ?? 0}`, `首字时间 p99`)}
-		${card(d.latencyAvg, s.latencyAvg === null ? "--" : fmtMs(s.latencyAvg), `${d.samples} ${s.latencySamples ?? 0}`, `单次调用耗时均值（会话 durationMs / turn 时长）`)}
-		${card(d.tokPerSec, fmtTokps(s.tokPerSec), `${d.tokpsNote} · ${tokNote}`, `${d.tokPerSec}：${d.tokpsNote}（Σ输出 ÷ Σ耗时）；${d.tokpsMean} ${fmtTokps(s.tokPerSecMean)}（${s.tokPerSecSamples ?? 0} 次调用）`)}
-		${card(d.cacheHitRate, fmtRate(s.cacheHitRate), cacheNote, cacheTitle)}
-		${card(d.tokensTotal, fmtInt(tokens.total), tokenNote, `token 合计：${tokenNote}`)}
-		${card(d.cost, fmtCost(cost.amount), costNote, costTitle)}
-	</div>`;
-}
-
-/** 按模型汇总表（点行 → 只看该模型）。 */
-function renderModels(rows, d) {
-	if (!Array.isArray(rows) || !rows.length) return `<div class="cps-empty">${esc(d.emptyWindow)}</div>`;
-	const body = rows
-		.map((row) => {
-			const ttft = row.ttft ?? {};
-			return `<tr data-model="${esc(row.model)}" title="${esc(`${d.modelFilter} ${row.model}`)}">
-				<td>${esc(row.model)}</td>
-				<td class="mono">${esc(fmtInt(row.calls))}</td>
-				<td class="mono">${esc(fmtRate(row.successRate))}</td>
-				<td class="mono">${esc(ttft.p50 === null || ttft.p50 === undefined ? "--" : fmtMs(ttft.p50))}</td>
-				<td class="mono">${esc(ttft.p90 === null || ttft.p90 === undefined ? "--" : fmtMs(ttft.p90))}</td>
-				<td class="mono">${esc(row.latencyAvg === null || row.latencyAvg === undefined ? "--" : fmtMs(row.latencyAvg))}</td>
-				<td class="mono" title="${esc(d.tokpsNote)}">${esc(fmtTokps(row.tokPerSec))}</td>
-				<td class="mono" title="${esc(`${d.tokensIn} ${row.tokens?.input ?? 0} · ${d.tokensOut} ${row.tokens?.output ?? 0} · ${d.cacheRead} ${row.tokens?.cacheRead ?? 0} · ${d.cacheWrite} ${row.tokens?.cacheWrite ?? 0} · ${d.reasoning} ${row.tokens?.reasoning ?? 0}`)}">${esc(fmtInt(row.tokens?.total ?? 0))}</td>
-				<td class="mono" title="${esc(`${d.cacheHitNote}；${d.tokpsMean} ${fmtRate(row.cacheHitRateMean)}（${row.cacheHitSamples ?? 0} ${d.samples}）`)}">${esc(fmtRate(row.cacheHitRate))}</td>
-				<td class="mono" title="${esc(`${d.costSdk} ${fmtCost(row.cost?.sdkAmount ?? null)} + ${d.costSourceEstimate} ${fmtCost(row.cost?.estimatedAmount ?? null, "estimate")}`)}">${esc(fmtCost(row.cost?.amount ?? null))}</td>
-				<td class="mono">${esc(fmtShare(row.costShare ?? row.callShare ?? null))}</td>
-			</tr>`;
-		})
-		.join("");
-	return `<div class="cps-tbl-wrap"><table class="cps-tbl cps-models">
-		<thead><tr>
-			<th>${esc(d.thModel)}</th><th>${esc(d.thCalls)}</th><th>${esc(d.thSuccess)}</th>
-			<th>${esc(d.thTtftP50)}</th><th>${esc(d.thTtftP90)}</th><th>${esc(d.thLatency)}</th>
-			<th title="${esc(d.tokpsNote)}">${esc(d.thTokps)}</th><th>${esc(d.thTokens)}</th><th title="${esc(d.cacheHitNote)}">${esc(d.thCacheHit)}</th><th>${esc(d.thCost)}</th><th>${esc(d.thShare)}</th>
-		</tr></thead>
-		<tbody>${body}</tbody>
-	</table></div>`;
-}
-
-/** 价格面板：每个模型用的哪一行价 + 候选数（brief A6：候选必须可枚举）。 */
-function renderPrices(box, d) {
-	if (!box) return `<div class="cps-empty">${esc(d.priceNever)}</div>`;
-	const status = box.status ?? {};
-	const rows = Array.isArray(box.models) ? box.models : [];
-	const sourceText = (status.sources ?? [])
-		.map((s) => `${s.label}:${s.ok ? s.count : "—"}`)
-		.join(" · ");
-	const stamp = status.fetchedAt ? fmtTime(status.fetchedAt) : d.priceNever;
-	const head = `<div class="cps-hint">${esc(d.priceStatus)}：${esc(stamp)}${status.stale ? ` · ${esc(d.priceStale)}` : ""} · ${esc(fmtInt(status.entries ?? 0))} 行${sourceText ? ` · ${esc(sourceText)}` : ""}${status.lastError ? ` · ${esc(status.lastError)}` : ""}
-		<button class="cps-btn" data-act="refreshPrices">${esc(d.priceRefresh)}</button></div>`;
-	if (!rows.length) return `${head}<div class="cps-empty">${esc(d.priceNone)}</div>`;
-	const viaLabel = { override: d.viaOverride, official: d.viaOfficial, median: d.viaMedian };
-	const body = rows
-		.map((row) => {
-			const prices = row.priceId
-				? `${fmtPrice(row.input)} / ${fmtPrice(row.output)} / ${fmtPrice(row.cacheRead)} / ${fmtPrice(row.cacheWrite)}`
-				: "--";
-			return `<tr><td>${esc(row.model)}</td>
-				<td class="cps-c-dim">${esc(viaLabel[row.via] ?? "--")}</td>
-				<td class="mono cps-c-dim"><code>${esc(row.priceId ?? "--")}</code></td>
-				<td class="mono">${esc(prices)}</td>
-				<td class="mono">${esc(fmtInt(row.candidates ?? 0))}</td></tr>`;
-		})
-		.join("");
-	return `${head}
-	<div class="cps-tbl-wrap"><table class="cps-tbl cps-prices">
-		<thead><tr>
-			<th>${esc(d.priceModel)}</th><th>${esc(d.priceVia)}</th>
-			<th>${esc(d.priceChosen)}</th><th title="${esc(`${d.tokensIn} / ${d.tokensOut} / ${d.cacheRead} / ${d.cacheWrite}（USD / 1M token）`)}">USD/1M</th><th>${esc(d.priceCandidates)}</th>
-		</tr></thead>
-		<tbody>${body}</tbody>
-	</table></div>
-	<div class="cps-hint">${esc(d.priceOverrideHint)}</div>`;
-}
-
-function statusBadge(status, d) {
-	if (status === "error") return `<span class="cps-badge bad">${esc(d.statusFailed)}</span>`;
-	if (status === "incomplete") return `<span class="cps-badge cancel">${esc(d.statusIncomplete)}</span>`;
-	return `<span class="cps-badge ok">${esc(d.statusOk)}</span>`;
-}
-
-function sourceLabel(record, d) {
-	const sources = Array.isArray(record.sources) && record.sources.length ? record.sources : [record.source];
-	if (sources.length > 1) return d.sourceBoth;
-	return sources[0] === "live" ? d.sourceLive : d.sourceBackfill;
-}
-
-/** 记录明细表（分页 + 列开关 + CSV 导出 + 点开明细）。 */
-const ALL_COLS = ["time", "model", "provider", "thinking", "tokens", "cache", "ttft", "duration", "tokps", "cost", "status"];
-
-/** 读列开关偏好（locolStorage；禁用/损坏时全部显示）。 */
-function readHiddenCols() {
-	try {
-		const raw = window.localStorage.getItem("cps:hiddenCols");
-		if (!raw) return [];
-		const list = JSON.parse(raw);
-		return Array.isArray(list) ? list.filter((c) => ALL_COLS.includes(c)) : [];
-	} catch {
-		return [];
-	}
-}
-
-function writeHiddenCols(list) {
-	try {
-		window.localStorage.setItem("cps:hiddenCols", JSON.stringify(list));
-	} catch {
-		/* 隐私模式禁 localStorage：不记忆，不影响功能 */
-	}
-}
-
-function colVisible(state, col) {
-	const hidden = Array.isArray(state.hiddenCols) ? state.hiddenCols : [];
-	return !hidden.includes(col);
-}
-
-/** 一条记录的缓存列：`读/写 · 命中%`（分母为 0 或老会话没有缓存字段 → `--`）。 */
-function fmtCacheCell(r) {
-	const rate = r.cacheHitRate === null || r.cacheHitRate === undefined ? null : Number(r.cacheHitRate);
-	const hit = rate === null || !Number.isFinite(rate) ? "--" : `${(rate * 100).toFixed(1)}%`;
-	return `${fmtInt(r.cacheReadTokens ?? 0)}/${fmtInt(r.cacheWriteTokens ?? 0)} · ${hit}`;
-}
-
-/** 组装 CSV 文本（带 BOM，Excel 中文不乱码）。
- *  纯函数：给定行数据与列清单返回字符串，单测可直接断言。 */
-export function buildCsv(rows, d) {
-	const head = [d.thTime, d.thModel, d.thProvider, d.thThinking, d.thTokens, d.thCache, d.thCacheHit, d.thTtft, d.thDuration, d.thTokps, d.thCost, d.thStatus];
-	const cells = (r) => {
-		const tokps =
-			Number(r.outputTokens) > 0 && Number(r.durationMs) > 0 ? Number(r.outputTokens) / (Number(r.durationMs) / 1000) : null;
-		const status = r.status === "error" ? d.statusFailed : r.status === "incomplete" ? d.statusIncomplete : d.statusOk;
-		// 缓存命中率：分母为 0 / 没有缓存字段 → 空（不是 0%）
-		const hit = r.cacheHitRate === null || r.cacheHitRate === undefined ? null : Number(r.cacheHitRate);
-		return [
-			new Date(Number(r.ts) || 0).toISOString(),
-			r.model ?? "",
-			r.provider ?? "",
-			r.thinkingLevel ?? "",
-			String(Number(r.totalTokens ?? 0)),
-			`${Number(r.cacheReadTokens ?? 0)}/${Number(r.cacheWriteTokens ?? 0)}`,
-			hit === null || !Number.isFinite(hit) ? "" : (hit * 100).toFixed(2),
-			r.ttftMs === null || r.ttftMs === undefined ? "" : String(Number(r.ttftMs)),
-			r.durationMs === null || r.durationMs === undefined ? "" : String(Number(r.durationMs)),
-			tokps === null ? "" : tokps.toFixed(2),
-			r.costUsd === null || r.costUsd === undefined ? "" : Number(r.costUsd).toFixed(6),
-			status,
-		];
-	};
-	const esc = (v) => {
-		const s = String(v ?? "");
-		return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-	};
-	const lines = [head.map(esc).join(",")];
-	for (const r of rows ?? []) lines.push(cells(r).map(esc).join(","));
-	return `\uFEFF${lines.join("\r\n")}\r\n`;
-}
-
-function renderRecords(state, d) {
-	const list = Array.isArray(state.records) ? state.records : [];
-	if (!list.length) return `<div class="cps-empty">${esc(state.summary?.calls ? d.emptyWindow : d.empty)}</div>`;
-	const rows = list
-		.map((r) => {
-			const open = state.expandedId === r.id;
-			const rid = esc(r.id);
-			const tokps = Number(r.outputTokens) > 0 && Number(r.durationMs) > 0 ? Number(r.outputTokens) / (Number(r.durationMs) / 1000) : null;
-			const main = `<tr data-rid="${rid}">
-				${colVisible(state, "time") ? `<td class="mono">${esc(fmtTime(r.ts))}</td>` : ""}
-				${colVisible(state, "model") ? `<td>${esc(r.model ?? d.unknown)}</td>` : ""}
-				${colVisible(state, "provider") ? `<td class="cps-c-dim">${esc(r.provider ?? "--")}</td>` : ""}
-				${colVisible(state, "thinking") ? `<td class="cps-c-dim">${esc(r.thinkingLevel ?? "--")}</td>` : ""}
-				${colVisible(state, "tokens") ? `<td class="mono">${esc(fmtInt(r.totalTokens ?? 0))}</td>` : ""}
-				${colVisible(state, "cache") ? `<td class="mono cps-c-dim" title="${esc(`${d.kvCacheHit} = ${d.cacheRead} ÷ (${d.tokensIn} + ${d.cacheRead} + ${d.cacheWrite})`)}">${esc(fmtCacheCell(r))}</td>` : ""}
-				${colVisible(state, "ttft") ? `<td class="mono">${esc(r.ttftMs === null || r.ttftMs === undefined ? "--" : fmtMs(r.ttftMs))}</td>` : ""}
-				${colVisible(state, "duration") ? `<td class="mono">${esc(r.durationMs === null || r.durationMs === undefined ? "--" : fmtMs(r.durationMs))}</td>` : ""}
-				${colVisible(state, "tokps") ? `<td class="mono">${esc(fmtTokps(tokps))}</td>` : ""}
-				${colVisible(state, "cost") ? `<td class="mono" title="${esc(`${costSourceLabel(r.costSource, d)}${r.priceId ? ` · ${r.priceId}` : ""}${r.priceNote ? ` · ${r.priceNote}` : ""}`)}">${esc(fmtCost(r.costUsd, r.costSource))}</td>` : ""}
-				${colVisible(state, "status") ? `<td>${statusBadge(r.status, d)}</td>` : ""}
-			</tr>`;
-			if (!open) return main;
-			const span = ALL_COLS.filter((c) => colVisible(state, c)).length || 1;
-			const detail = `<tr class="cps-detail"><td colspan="${span}">
-				${esc(d.thDetail)}：<b>${esc(d.kvIn)}</b> ${esc(fmtInt(r.inputTokens ?? 0))} ·
-				<b>${esc(d.kvOut)}</b> ${esc(fmtInt(r.outputTokens ?? 0))} ·
-				<b>${esc(d.kvCacheRead)}</b> ${esc(fmtInt(r.cacheReadTokens ?? 0))} ·
-				<b>${esc(d.kvCacheWrite)}</b> ${esc(fmtInt(r.cacheWriteTokens ?? 0))} ·
-				<b>${esc(d.kvReasoning)}</b> ${esc(fmtInt(r.reasoningTokens ?? 0))} ·
-				<b>${esc(d.kvTotal)}</b> ${esc(fmtInt(r.totalTokens ?? 0))} ·
-				<b>${esc(d.kvCacheHit)}</b> ${esc(fmtRate(r.cacheHitRate))} ·
-				<b>${esc(d.kvEstimate)}</b> ${esc(fmtCost(r.costEstimateUsd, "estimate"))}<br/>
-				${esc(d.thSource)}：${esc(sourceLabel(r, d))} ·
-				${esc(d.cost)}：${esc(costSourceLabel(r.costSource, d))}${r.priceId ? ` · ${esc(d.kvPriceId)} <code>${esc(r.priceId)}</code>` : ""}${r.priceNote ? ` · ${esc(r.priceNote)}` : ""} ·
-				${esc(d.stopped)}：${esc(r.stopReason ?? "--")} ·
-				${esc(d.id)}：<code>${esc(r.id)}</code>
-			</td></tr>`;
-			return main + detail;
-		})
-		.join("");
-	const pages = Math.max(1, Number(state.pages) || 1);
-	const page = Math.min(pages, Math.max(1, Number(state.page) || 1));
-	const head = `<tr>
-		${colVisible(state, "time") ? `<th>${esc(d.thTime)}</th>` : ""}
-		${colVisible(state, "model") ? `<th>${esc(d.thModel)}</th>` : ""}
-		${colVisible(state, "provider") ? `<th>${esc(d.thProvider)}</th>` : ""}
-		${colVisible(state, "thinking") ? `<th>${esc(d.thThinking)}</th>` : ""}
-		${colVisible(state, "tokens") ? `<th>${esc(d.thTokens)}</th>` : ""}
-		${colVisible(state, "cache") ? `<th>${esc(d.thCache)}</th>` : ""}
-		${colVisible(state, "ttft") ? `<th>${esc(d.thTtft)}</th>` : ""}
-		${colVisible(state, "duration") ? `<th>${esc(d.thDuration)}</th>` : ""}
-		${colVisible(state, "tokps") ? `<th>${esc(d.thTokps)}</th>` : ""}
-		${colVisible(state, "cost") ? `<th>${esc(d.thCost)}</th>` : ""}
-		${colVisible(state, "status") ? `<th>${esc(d.thStatus)}</th>` : ""}
-	</tr>`;
-	const colToggle = state.showColSettings
-		? `<div class="cps-tools">${ALL_COLS.map((c) => {
-				const label = {
-					time: d.thTime, model: d.thModel, provider: d.thProvider, thinking: d.thThinking,
-					tokens: d.thTokens, cache: d.thCache, ttft: d.thTtft, duration: d.thDuration,
-					tokps: d.thTokps, cost: d.thCost, status: d.thStatus,
-				}[c];
-				return `<label class="cps-col"><input type="checkbox" data-act="col" data-value="${c}" ${colVisible(state, c) ? "checked" : ""}/> ${esc(label)}</label>`;
-			}).join("")}</div>`
-		: "";
-	const pager = `<div class="cps-pager">
-		<span>${esc(d.total)} ${esc(fmtInt(state.total ?? list.length))} ${esc(d.rows)} · ${esc(d.page(page, pages))}</span>
-		<button class="cps-btn" data-act="toggleCols">${esc(d.colSettings)}</button>
-		<button class="cps-btn" data-act="exportCsv" title="${esc(d.exportHint)}">${esc(d.exportCsv)}</button>
-		<select class="cps-sel" data-act="pageSize">${[20, 50, 100, 200]
-			.map((n) => `<option value="${n}" ${n === Number(state.pageSize) ? "selected" : ""}>${n}${esc(d.rowsPerPage)}</option>`)
-			.join("")}</select>
-		<button class="cps-btn" data-act="page" data-value="${page - 1}" ${page <= 1 ? "disabled" : ""}>${esc(d.prev)}</button>
-		<button class="cps-btn" data-act="page" data-value="${page + 1}" ${page >= pages ? "disabled" : ""}>${esc(d.next)}</button>
-	</div>`;
-	return `<div class="cps-tbl-wrap"><table class="cps-tbl cps-records">
-		<thead>${head}</thead>
-		<tbody>${rows}</tbody>
-	</table></div>${colToggle}${pager}`;
-}
-
-/** 顶部降级/授权提示（只在需要时出现）。 */
-function renderNotice(state, d) {
-	const meta = state.meta ?? {};
-	const grant = meta.grant ?? null;
-	const needsGrant = Boolean(grant?.required);
-	const error = state.error;
-	if (!error && !needsGrant) return "";
-	const reason = error?.reason ?? grant?.reason ?? d.liveOnly;
-	const reasonEn = error?.reasonEn ?? grant?.reasonEn ?? "";
-	const hint = error?.hint ?? grant?.hint ?? "";
-	const lines = [
-		`${esc(reason)}${reasonEn && reasonEn !== reason ? ` · ${esc(reasonEn)}` : ""}`,
-		hint ? `<p><code>${esc(hint)}</code></p>` : "",
-	];
-	const tried = Array.isArray(error?.candidates) && error.candidates.length
-		? `<details class="cps-tried"><summary>${esc(d.sessionsRoot)}</summary><ul>${error.candidates
-				.map((c) => `<li>${esc(c)}</li>`)
-				.join("")}</ul></details>`
-		: "";
-	return `<div class="cps-notice">
-		<h3>${esc(d.noticeTitle)}</h3>
-		<p>${lines.join("")}</p>
-		${needsGrant ? `<p>${esc(d.grantHint)}</p>` : ""}
-		${tried}
-		<div class="cps-filters">
-			<button class="cps-btn" data-act="refresh">${esc(d.retry)}</button>
-			${needsGrant ? `<button class="cps-btn primary" data-act="grant">${esc(d.grant)}</button>` : ""}
-		</div>
-	</div>`;
-}
-
-function segmented(values, current, act, labels) {
-	return `<span class="cps-seg">${values
-		.map(
-			(v) =>
-				`<button data-act="${esc(act)}" data-value="${esc(v)}" class="${current === v ? "on" : ""}">${esc(labels[v] ?? v)}</button>`,
-		)
-		.join("")}</span>`;
-}
-
-/** 顶栏状态行：账本规模 / 会话目录 / 上次回填 / 模式。 */
-function renderMetaLine(state, d) {
-	const meta = state.meta ?? {};
-	const ledger = meta.ledger ?? {};
-	const backfill = meta.backfill ?? null;
-	const coverage = meta.coverage ?? backfill?.coverage ?? null;
-	const last = backfill?.finishedAt ? fmtTime(backfill.finishedAt) : d.never;
-	const importing = Boolean(meta.importing ?? backfill?.truncated);
-	// 覆盖率必须看得见：不能让人拿「看着已导完」的数字做判断
-	const coverageText =
-		coverage && coverage.eligible > 0
-			? `${esc(d.fileCoverage)} ${esc(fmtInt(coverage.imported))}/${esc(fmtInt(coverage.eligible))} ${esc(d.sessionFiles)}${importing ? ` <span class="cps-c-amber">${esc(d.importing)}</span>` : ""}`
-			: "";
-	const parts = [
-		`${esc(d.ledger)} ${esc(fmtInt(ledger.records ?? 0))} ${esc(d.rows)}`,
-		`${esc(d.sessionsRoot)} <code>${esc(meta.sessionsRoot ?? "--")}</code>`,
-		`${esc(d.lastBackfill)} ${esc(last)}${backfill ? ` · ${esc(fmtInt(backfill.files ?? 0))} ${esc(d.files)}` : ""}`,
-	];
-	if (coverageText) parts.unshift(coverageText);
-	if (meta.mode === "live-only") parts.push(`<span class="cps-c-amber">${esc(d.liveOnly)}</span>`);
-	const stopBtn = importing ? `<button class="cps-btn" data-act="stopImport">${esc(d.stopImport)}</button>` : "";
-	return `<div class="cps-meta">${parts.join(" · ")}${stopBtn ? ` ${stopBtn}` : ""}</div>`;
-}
-
-/** 整页渲染。 */
-function renderDashboard(state, d) {
-	const summary = state.summary;
-	const meta = state.meta ?? {};
-	const ok = Boolean(summary) && state.error === null;
-	const winSeg = segmented(["today", "7d", "30d", "all"], state.window, "window", d.win);
-	const bucketSeg = segmented(["hour", "day"], state.bucket, "bucket", d.bucket);
-	const statusSeg = segmented(["all", "ok", "error", "incomplete"], state.status, "status", {
-		all: d.statusAll,
-		ok: d.statusOk,
-		error: d.statusFailed,
-		incomplete: d.statusIncomplete,
-	});
-	const modelChip = state.model
-		? `<button class="cps-chip" data-act="clearModel" title="${esc(d.clearFilter)}">${esc(d.modelFilter)} ${esc(state.model)} ✕</button>`
-		: "";
-	const series = Array.isArray(state.series) ? state.series : [];
-	const body = ok
-		? `${renderCards(summary, d)}
-			<div class="cps-grid2">
-				<div class="cps-panel">
-					<h3>${esc(d.chartCalls)}</h3>
-					${callsChart(series, d)}
-					${legend([
-						{ color: "var(--accent, #7c5cff)", label: d.legendCalls },
-						{ color: "var(--red, #ef4444)", label: d.legendFailed },
-					])}
-				</div>
-				<div class="cps-panel">
-					<h3>${esc(d.chartTtft)}</h3>
-					${ttftChart(series, d)}
-					${legend([
-						{ color: "var(--accent, #7c5cff)", label: d.legendP50 },
-						{ color: "var(--amber, #f59e0b)", label: d.legendP90 },
-					])}
-					<div class="cps-hint">${esc(d.ttftNote)}</div>
-				</div>
-			</div>
-			<div class="cps-panel">
-				<h3>${esc(d.modelsTable)}</h3>
-				${renderModels(state.models ?? [], d)}
-			</div>
-			<div class="cps-panel">
-				<h3>${esc(d.pricesTable)}</h3>
-				${renderPrices(state.prices, d)}
-			</div>
-			<div class="cps-panel">
-				<h3>${esc(d.recordsTable)}</h3>
-				<div class="cps-filters">${statusSeg}${modelChip}</div>
-				${renderRecords(state, d)}
-			</div>`
-		: `${renderNotice(state, d)}${state.loading ? `<div class="cps-empty">${esc(d.loading)}</div>` : ""}`;
-	const grantBtn = meta.grant?.required
-		? `<button class="cps-btn primary" data-act="grant">${esc(d.grant)}</button>`
-		: "";
-	return `<div class="cps-head">
-			<span class="cps-title">📊 ${esc(d.title)}</span>
-			<span class="cps-sub">${esc(d.subtitle)}</span>
-			<span class="cps-spacer"></span>
-			${winSeg}${bucketSeg}${grantBtn}
-			<button class="cps-btn" data-act="backfill" ${state.loading ? "disabled" : ""}>${esc(d.backfill)}</button>
-			<button class="cps-btn" data-act="refresh" ${state.loading ? "disabled" : ""}>${esc(state.loading ? d.loading : d.refresh)}</button>
-		</div>
-		${renderMetaLine(state, d)}
-		${ok ? renderNotice(state, d) : ""}
-		${state.notice ? `<div class="cps-notice">${esc(state.notice)}</div>` : ""}
-		${body}`;
-}
+const apiBase = () => `/plugins-api/${PLUGIN_ID}`;
 
 // ──────────────────────────────────────────────────────────── 运行时
 
 const runtime = {
-	container: null,
 	root: null,
-	timer: null,
-	viewObserver: null,
-	inflight: null,
+	refs: null,
+	state: null,
+	d: dict("zh"),
+	mounted: false,
+	charts: { calls: null, latency: null },
+	sparks: new Map(),
+	overviewCtl: null,
+	recordsCtl: null,
+	pollTimer: null,
+	importTimer: null,
+	noticeTimer: null,
+	sentinelObserver: null,
 	langObserver: null,
 	offLocale: null,
-	lang: "zh",
-	busy: false,
-	state: {
-		window: "today",
-		bucket: "hour",
-		model: "",
-		status: "all",
-		page: 1,
-		pageSize: PAGE_SIZE,
-		summary: null,
-		models: null,
-		prices: null,
-		series: null,
-		records: null,
-		pages: 1,
-		total: 0,
-		meta: null,
-		error: null,
-		loading: false,
-		expandedId: null,
-		hiddenCols: readHiddenCols(),
-		showColSettings: false,
-		notice: "",
-	},
+	offViewChange: null,
+	cleanups: [],
+	chartSig: "",
+	hashGuard: false,
 };
 
-function paint() {
-	if (!runtime.root) return;
-	const d = dict(runtime.state.lang);
-	runtime.root.innerHTML = renderDashboard(runtime.state, d);
+// ──────────────────────────────────────────────────────────── 请求层
+
+/** 组合「超时信号」与「主动取消信号」；有 `AbortSignal.any` 就全用，否则退化为定时器取消。 */
+function deriveSignal(controller) {
+	if (typeof AbortSignal !== "undefined" && typeof AbortSignal.any === "function" && typeof AbortSignal.timeout === "function") {
+		return AbortSignal.any([controller.signal, AbortSignal.timeout(TIMEOUT_MS)]);
+	}
+	if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+		return AbortSignal.timeout(TIMEOUT_MS);
+	}
+	setTimeout(() => {
+		if (!controller.signal.aborted) {
+			try {
+				controller.abort(new Error("timeout"));
+			} catch {
+				controller.abort();
+			}
+		}
+	}, TIMEOUT_MS);
+	return controller.signal;
 }
 
-/** 拉取四路数据（并行 + 可中断）；失败只写 state.error，绝不抛错。 */
-async function load() {
-	if (runtime.inflight) {
+function isTimeoutError(err) {
+	const name = String(err?.name ?? "");
+	if (name === "TimeoutError") return true;
+	return /timed? ?out|timeout/i.test(String(err?.message ?? ""));
+}
+
+async function requestJson(path, params, controller) {
+	const qs = params && params.toString();
+	const url = `${apiBase()}${path}${qs ? `?${qs}` : ""}`;
+	const res = await fetch(url, {
+		signal: deriveSignal(controller),
+		headers: { Accept: "application/json" },
+		cache: "no-store",
+	});
+	if (!res || res.ok === false) {
+		// 合同要求永远 200 + ok 布尔，但代理/网关层仍可能给 4xx：尽量把结构化 code 带出来
+		let payload = null;
 		try {
-			runtime.inflight.abort();
+			payload = await res.json();
 		} catch {
-			/* ignore */
+			payload = null;
 		}
+		throw Object.assign(new Error(`HTTP ${res?.status ?? "?"}`), { code: payload?.code ?? "request-failed", payload });
 	}
-	const controller = new AbortController();
-	runtime.inflight = controller;
-	runtime.state.loading = true;
-	paint();
+	return res.json();
+}
+
+function classifyError(err) {
+	const code = err?.code ?? err?.payload?.code;
+	if (typeof code === "string" && code) return code;
+	return "request-failed";
+}
+
+// ──────────────────────────────────────────────────────────── 数据加载
+
+function isImportRunning() {
+	const phase = runtime.state?.importStatus?.phase;
+	if (phase && IMPORT_RUNNING.has(phase)) return true;
+	return Boolean(runtime.state?.data?.freshness?.importing);
+}
+
+function applyOverview(data) {
 	const st = runtime.state;
-	const common =
-		`window=${encodeURIComponent(st.window)}` +
-		`&model=${encodeURIComponent(st.model)}` +
-		`&bucket=${encodeURIComponent(st.bucket)}`;
-	const recordsQs =
-		`${common}&status=${encodeURIComponent(st.status)}` +
-		`&page=${encodeURIComponent(String(st.page))}` +
-		`&pageSize=${encodeURIComponent(String(st.pageSize))}`;
-	const base = apiBase();
-	const get = async (path, qs) => {
-		const res = await fetch(`${base}${path}?${qs}`, {
-			signal: controller.signal,
+	st.data = {
+		version: Number(data.version) || 0,
+		range: data.range ?? null,
+		freshness: data.freshness ?? null,
+		kpi: data.kpi ?? null,
+		series: Array.isArray(data.series) ? data.series : [],
+		topModels: Array.isArray(data.topModels) ? data.topModels : [],
+		topProjects: Array.isArray(data.topProjects) ? data.topProjects : [],
+		filters: data.filters ?? {},
+		prices: data.prices ?? null,
+	};
+}
+
+function noteFailure(payload) {
+	const st = runtime.state;
+	const code = payload?.code ?? "unknown";
+	st.ui.lastError = {
+		code,
+		reason: String(payload?.reason ?? payload?.message ?? ""),
+		hint: String(payload?.hint ?? ""),
+		at: Date.now(),
+	};
+	// 有旧数据就保留（stale-while-error），没有才落到 error 整页态
+	st.phase = st.data ? "stale" : "error";
+}
+
+/** 拉 overview（首屏 1 个请求，切范围/筛选/刷新各 1 个）。 */
+async function loadOverview() {
+	if (!runtime.mounted) return;
+	const st = runtime.state;
+	const reqId = (st.ui.reqId += 1);
+	const query = cloneQuery(st.query);
+	const controller = new AbortController();
+	try {
+		runtime.overviewCtl?.abort();
+	} catch {
+		/* 旧请求已结束 */
+	}
+	runtime.overviewCtl = controller;
+	if (st.phase !== "loading") st.phase = "loading";
+	render();
+	let data = null;
+	let failure = null;
+	let aborted = false;
+	try {
+		data = await requestJson("/api/v3/overview", apiParams(query), controller);
+		if (!data || data.ok !== true) failure = data ?? { ok: false, code: "unknown" };
+	} catch (err) {
+		if (controller.signal.aborted && !isTimeoutError(err)) aborted = true;
+		else failure = { ok: false, code: classifyError(err), reason: String(err?.message ?? err) };
+	}
+	// 代数守卫：旧响应不得覆盖新状态（也不得复位 loading）
+	if (aborted || reqId !== st.ui.reqId || !runtime.mounted) return;
+	if (failure) {
+		noteFailure(failure);
+	} else {
+		applyOverview(data);
+		st.phase = "ready";
+		st.ui.lastError = null;
+	}
+	st.ui.lastLoadAt = Date.now();
+	render();
+}
+
+/** 拉一条明细页（首屏不发；切表格视图 / 滚到底部 / 翻页时才发）。 */
+async function loadRecords(options = {}) {
+	const st = runtime.state;
+	if (!runtime.mounted) return;
+	const reset = Boolean(options.reset);
+	const cursor = options.cursor ?? null;
+	const sig = querySig(st.query);
+	const reqId = (st.ui.recordsReqId += 1);
+	const controller = new AbortController();
+	try {
+		runtime.recordsCtl?.abort();
+	} catch {
+		/* 旧请求已结束 */
+	}
+	runtime.recordsCtl = controller;
+	st.records.loading = true;
+	render();
+	const params = apiParams(st.query);
+	params.set("limit", String(st.records.limit));
+	if (cursor) params.set("cursor", cursor);
+	let failure = null;
+	let data = null;
+	try {
+		data = await requestJson("/api/v3/records", params, controller);
+		if (!data || data.ok !== true) failure = data ?? { ok: false, code: "unknown" };
+	} catch (err) {
+		if (controller.signal.aborted && !isTimeoutError(err)) {
+			// 被新请求接管：loading 归新请求管；被卸载打断时也不能把 loading 留在 true
+			if (reqId === st.ui.recordsReqId) {
+				st.records.loading = false;
+				render();
+			}
+			return;
+		}
+		failure = { ok: false, code: classifyError(err), reason: String(err?.message ?? err) };
+	}
+	if (reqId !== st.ui.recordsReqId || !runtime.mounted) return;
+	if (failure) {
+		st.records.error = failure.code ?? "unknown";
+	} else {
+		const items = Array.isArray(data.records) ? data.records : [];
+		st.records.items = reset ? items : [...st.records.items, ...items];
+		st.records.total = Number(data.total) || st.records.total;
+		st.records.nextCursor = data.nextCursor ?? null;
+		st.records.cursor = cursor;
+		st.records.sig = sig;
+		st.records.error = null;
+	}
+	st.records.loading = false;
+	render();
+}
+
+function ensureRecords() {
+	const st = runtime.state;
+	const sig = querySig(st.query);
+	if (st.records.sig === sig && st.records.items.length) return;
+	void loadRecords({ reset: true, cursor: null });
+}
+
+/** 导入状态（首屏 1 个请求，之后按运行/空闲节流轮询）。 */
+async function loadImportStatus() {
+	if (!runtime.mounted) return;
+	const controller = new AbortController();
+	try {
+		const data = await requestJson("/api/v3/import/status", null, controller);
+		if (!runtime.mounted || !data || data.ok !== true) return;
+		const prev = runtime.state.importStatus;
+		const next = data.status ?? null;
+		runtime.state.importStatus = next;
+		render();
+		if (prev && next && prev.phase !== next.phase && (next.phase === "done" || next.phase === "error")) {
+			void loadOverview();
+		}
+	} catch {
+		/* 状态端点失败不影响主看板：保留旧值 */
+	}
+}
+
+async function postAction(path, opts = {}) {
+	const controller = new AbortController();
+	try {
+		await fetch(`${apiBase()}${path}`, {
+			method: "POST",
+			signal: deriveSignal(controller),
 			headers: { Accept: "application/json" },
 		});
-		if (!res.ok) throw new Error(`HTTP ${res.status}`);
-		return res.json();
-	};
-	try {
-		const [summary, series, records, meta] = await Promise.all([
-			get("/api/summary", common),
-			get("/api/series", common),
-			get("/api/records", recordsQs),
-			get("/api/meta", ""),
-		]);
-		if (controller.signal.aborted) return;
-		runtime.state.summary = summary?.ok ? summary.summary : null;
-		runtime.state.models = summary?.ok ? (summary.models ?? []) : [];
-		runtime.state.prices = summary?.ok ? (summary.prices ?? null) : null;
-		runtime.state.series = series?.ok ? (series.series ?? []) : [];
-		runtime.state.records = records?.ok ? (records.records ?? []) : [];
-		runtime.state.pages = records?.pages ?? 1;
-		runtime.state.total = records?.total ?? 0;
-		runtime.state.meta = meta?.ok ? meta.meta : (summary?.meta ?? null);
-		runtime.state.error = summary?.ok ? null : (summary ?? { code: "unknown", reason: "统计接口没有返回" });
-	} catch (err) {
-		if (controller.signal.aborted) return;
-		// 网络/路由错误也走空态，不刷 console 噪声
-		runtime.state.error = {
-			code: "request-failed",
-			reason: `无法读取统计接口：${err?.message ?? err}`,
-			reasonEn: `Cannot reach the stats API: ${err?.message ?? err}`,
-			hint: "",
-			candidates: [],
-		};
-	} finally {
-		// 只有「当前请求」能复位 loading：被新请求接管或卸载时不能把标志留在 true
-		if (runtime.inflight === controller) {
-			runtime.state.loading = false;
-			runtime.inflight = null;
-			paint();
-		}
-	}
-}
-
-/** POST 动作（回填 / 授权）：有副作用不走 GET；失败只提示，不抛错。 */
-async function postAction(path) {
-	if (runtime.busy) return;
-	runtime.busy = true;
-	try {
-		await fetch(`${apiBase()}${path}`, { method: "POST", headers: { Accept: "application/json" } });
 	} catch {
-		/* 静默：紧接着的 load() 会把状态显示出来 */
-	} finally {
-		runtime.busy = false;
+		/* 端点按合同「立即返回、后台推进」，失败也由下一次状态轮询体现 */
 	}
-	runtime.state.page = 1;
-	void load();
+	await loadImportStatus();
+	if (opts.reload) void loadOverview();
 }
 
-/** 导出当前筛选下的记录（分页拉完，上限 5000 行）。失败只改 notice，不抛错。 */
-async function exportCsv() {
-	const d = dict(runtime.state.lang);
+// ──────────────────────────────────────────────────────────── URL 状态
+
+function syncHash() {
 	const st = runtime.state;
-	const MAX_ROWS = 5000;
-	const PAGE = 200;
-	const base = apiBase();
-	const rows = [];
-	let page = 1;
-	let capped = false;
+	if (!st) return;
+	const next = buildHash(st.query);
+	if (location.hash === next) return;
+	// 宿主若自己用 hash 做路由（形如 `#/c/xxx`），不去覆盖它：状态留在内存里
+	if (location.hash && !location.hash.startsWith(`#${HASH_PREFIX}`)) return;
+	runtime.hashGuard = true;
 	try {
-		while (rows.length < MAX_ROWS) {
-			const qs =
-				`window=${encodeURIComponent(st.window)}` +
-				`&model=${encodeURIComponent(st.model)}` +
-				`&status=${encodeURIComponent(st.status)}` +
-				`&page=${page}` +
-				`&pageSize=${PAGE}`;
-			const res = await fetch(`${base}/api/records?${qs}`, { headers: { Accept: "application/json" } });
-			if (!res.ok) throw new Error(`HTTP ${res.status}`);
-			const data = await res.json();
-			const list = data?.ok ? (data.records ?? []) : [];
-			rows.push(...list);
-			const pages = Number(data?.pages) || 1;
-			if (page >= pages || !list.length) break;
-			page++;
-		}
-	} catch (err) {
-		st.notice = `导出失败：${err?.message ?? err}`;
-		paint();
-		return;
+		history.replaceState(history.state ?? null, "", `${location.pathname}${location.search}${next}`);
+	} catch {
+		/* file:// 或禁用 history：状态仍在内存里，不影响功能 */
 	}
-	if (rows.length > MAX_ROWS) {
-		rows.length = MAX_ROWS;
-		capped = true;
-	}
-	if (!rows.length) {
-		st.notice = d.emptyWindow;
-		paint();
-		return;
-	}
-	try {
-		const csv = buildCsv(rows, d);
-		const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-		const url = URL.createObjectURL(blob);
-		const a = document.createElement("a");
-		a.href = url;
-		a.download = `usage-ledger-${st.window}${st.model ? `-${st.model}` : ""}.csv`;
-		document.body.appendChild(a);
-		a.click();
-		a.remove();
-		setTimeout(() => URL.revokeObjectURL(url), 1000);
-	} catch (err) {
-		st.notice = `导出失败：${err?.message ?? err}`;
-		paint();
-		return;
-	}
-	st.notice = capped ? d.exportCapped : d.exportDone(rows.length);
-	paint();
+	runtime.hashGuard = false;
 }
 
-/** 下拉（每页条数）用 change 事件，不进 click。 */
-function onRootChange(event) {
+function applyHash() {
+	if (!runtime.mounted || runtime.hashGuard) return;
+	const parsed = parseHash(location.hash);
+	if (!parsed.ok) return;
+	const st = runtime.state;
+	const next = cloneQuery(parsed.query);
+	if (JSON.stringify(next) === JSON.stringify(st.query)) return;
+	st.query = next;
+	resetRecords();
+	seedCustomInputs();
+	st.ui.lastError = null;
+	render();
+	void loadOverview();
+	if (next.view === "table") ensureRecords();
+}
+
+function resetRecords() {
+	const st = runtime.state;
+	st.records.items = [];
+	st.records.total = 0;
+	st.records.nextCursor = null;
+	st.records.cursor = null;
+	st.records.stack = [];
+	st.records.sig = "";
+	st.records.expandedId = null;
+	st.records.error = null;
+}
+
+/** 查询变化：立刻高亮 + 骨架，**不清空已渲染的图表/KPI**（stale-while-loading）。 */
+function onQueryChanged(options = {}) {
+	const st = runtime.state;
+	st.phase = "loading";
+	st.ui.lastError = null;
+	resetRecords();
+	syncHash();
+	render();
+	void loadOverview();
+	if (st.query.view === "table" || options.records) ensureRecords();
+}
+
+// ──────────────────────────────────────────────────────────── 渲染 · 文案
+
+function renderTexts(d) {
+	const st = runtime.state;
+	const values = {
+		"head.title": d.title,
+		"head.sub": d.subtitle,
+		"range.custom.from.label": d.customFrom,
+		"range.custom.to.label": d.customTo,
+		"range.apply": d.customApply,
+		"filter.model.label": d.filterModel,
+		"filter.provider.label": d.filterProvider,
+		"filter.project.label": d.filterProject,
+		"filter.status.label": d.filterStatus,
+		"filter.clear": d.clearFilters,
+		"head.refresh": st.phase === "loading" ? d.refreshing : d.refresh,
+		"head.export": { text: d.export, title: d.exportHint },
+		"chart.calls.title": d.charts.callsTitle,
+		"chart.calls.sub": d.charts.callsSub,
+		"chart.latency.title": d.charts.latencyTitle,
+		"chart.latency.sub": d.charts.latencySub,
+		"chart.calls.note": d.charts.hint,
+		"chart.latency.note": d.charts.hint,
+		"top.models.title": d.top.models,
+		"top.projects.title": d.top.projects,
+		"table.title": d.table.title,
+		"import.title": d.import.title,
+		"import.start": d.import.start,
+		"import.pause": d.import.pause,
+		"import.resume": d.import.resume,
+		"import.cancel": d.import.cancel,
+		"banner.stale.title": d.banner.staleTitle,
+		"banner.stale.retry": d.retry,
+		"banner.error.retry": d.retry,
+		"banner.error.grant": d.grant,
+		"banner.importing.title": d.banner.importingTitle,
+		"banner.importing.desc": d.banner.importingDesc,
+		"table.colsBtn": { text: d.columns, title: d.columns },
+	};
+	for (const status of STATUSES) values[`filter.status.text.${status}`] = d.statuses[status] ?? status;
+	for (const col of COLUMNS) values[`table.colText.${col.key}`] = d.table.cols[col.key] ?? col.key;
+	patch(runtime.root, values);
+}
+
+/** 分段控件（role=tablist）：高亮 + aria-selected + 只有一个 tabindex=0。 */
+function renderSegment(act, values, current, labels) {
+	const patchValues = {};
+	for (const value of values) {
+		const on = value === current;
+		patchValues[`${act}.tab.${value}`] = {
+			text: labels?.[value] ?? value,
+			cls: { on },
+			attrs: { "aria-selected": on ? "true" : "false", tabindex: on ? "0" : "-1" },
+		};
+	}
+	patch(runtime.root, patchValues);
+}
+
+function renderQueryState(d) {
+	const st = runtime.state;
+	const q = st.query;
+	renderSegment("range", RANGES, q.range, d.ranges);
+	renderSegment("gran", GRANS, q.gran, d.grans);
+	renderSegment("view", VIEWS, q.view, { chart: d.viewChart, table: d.viewTable });
+	patch(runtime.root, { "range.custom": { hidden: q.range !== "custom" } });
+	// 日期输入框是「草稿」：只在进入自定义/恢复 URL 时播种，渲染不再回写，
+	// 否则用户一边输入就被 patch 覆盖（排序/刷新任一帧都会触发）。
+	// 明细视图开关
+	const chartView = runtime.root.querySelector('[data-k="view.chart"]');
+	const tableView = runtime.root.querySelector('[data-k="view.table"]');
+	if (chartView) chartView.classList.toggle("cps-hidden", q.view !== "chart");
+	if (tableView) tableView.classList.toggle("cps-hidden", q.view !== "table");
+	renderFilters(d);
+}
+
+function renderFilters(d) {
+	const st = runtime.state;
+	const q = st.query;
+	const f = st.data?.filters ?? {};
+	const specs = [
+		["model", f.models, d.allValues],
+		["provider", f.providers, d.allValues],
+		["project", f.projects, d.allValues],
+	];
+	for (const [key, list, allLabel] of specs) {
+		const select = runtime.root.querySelector(`[data-k="filter.${key}"]`);
+		if (!select) continue;
+		const values = Array.isArray(list) ? list : [];
+		const current = q[key] && q[key] !== "all" ? q[key] : "all";
+		const items = [{ value: "all", label: allLabel }, ...values.map((v) => ({ value: v, label: v }))];
+		if (current !== "all" && !values.includes(current)) items.push({ value: current, label: current });
+		pool(select, items, {
+			key: (item) => item.value,
+			create: () => h("option"),
+			update: (nodes, item) => {
+				const option = nodes[0];
+				if (option.value !== item.value) option.value = item.value;
+				setText(option, item.label);
+			},
+		});
+		if (select.value !== current) select.value = current;
+	}
+	// 状态多选（`all` 或逗号列表）
+	const statusList = filterList(q.status);
+	patch(runtime.root, {
+		"filter.status.btn": {
+			text: statusList.length ? d.statusPicked(statusList.length, STATUSES.length) : d.allValues,
+			attrs: { "aria-expanded": st.table.statusOpen ? "true" : "false" },
+		},
+		"filter.status.panel": { hidden: !st.table.statusOpen },
+	});
+	for (const status of STATUSES) {
+		patch(runtime.root, { [`filter.status.opt.${status}`]: { checked: statusList.length === 0 || statusList.includes(status) } });
+	}
+	const active = activeFilterCount(q);
+	patch(runtime.root, {
+		"filter.summary": { text: active ? d.filtersActive(active) : "" },
+		"filter.clear": { hidden: active === 0 },
+	});
+}
+
+function renderTruth(d) {
+	const st = runtime.state;
+	const data = st.data;
+	if (!data) {
+		patch(runtime.root, { "head.truth": "" });
+		return;
+	}
+	const range = data.range ?? {};
+	const kpi = data.kpi ?? {};
+	const fresh = data.freshness ?? {};
+	const from = F.fmtDateLocal(range.fromMs);
+	const to = F.fmtDateLocal(range.toMs);
+	const gran = range.gran ?? "1h";
+	const granText = `${d.granValue ? d.granValue(gran) : gran}${range.granAuto ? d.granAutoSuffix : ""}`;
+	const asOf = F.fmtTimeLocal(fresh.lastIngestAt ?? range.toMs);
+	const text = `${from} → ${to} · ${F.fmtCount(kpi.calls)} ${d.truthCalls} · ${d.truthGran} ${granText} · ${d.truthAsOf} ${asOf} (${d.truthTz})`;
+	patch(runtime.root, { "head.truth": text });
+}
+
+function renderBanners(d) {
+	const st = runtime.state;
+	const err = st.ui.lastError;
+	const showError = Boolean(err);
+	const code = err?.code ?? "unknown";
+	const copy = d.errors[code] ?? d.errors.unknown;
+	patch(runtime.root, {
+		"banner.error": { hidden: !showError },
+		"banner.error.title": showError ? copy.title : "",
+		"banner.error.desc": showError
+			? `${copy.desc}${err?.reason ? ` · ${err.reason}` : ""}`
+			: "",
+		"banner.error.hint": showError ? String(err?.hint || copy.hint) : "",
+		"banner.error.grant": { hidden: code !== "no-fs-read" },
+	});
+	const stale = st.phase === "stale" && !showError;
+	patch(runtime.root, {
+		"banner.stale": { hidden: !stale },
+		"banner.stale.text": stale ? d.banner.staleAsOf(F.fmtTimeLocal(st.data?.freshness?.lastIngestAt)) : "",
+	});
+	const importing = isImportRunning();
+	patch(runtime.root, { "banner.importing": { hidden: !importing } });
+	const notice = st.ui.notice;
+	patch(runtime.root, { "banner.notice": { hidden: !notice }, "banner.notice.text": notice ?? "" });
+}
+
+// ──────────────────────────────────────────────────────────── 渲染 · KPI
+
+function renderKpis(d) {
+	const st = runtime.state;
+	const kpi = st.data?.kpi ?? null;
+	const series = st.data?.series ?? [];
+	const values = {};
+	for (const card of KPI_CARDS) {
+		values[`kpi.${card.id}.label`] = d.kpi[card.id];
+		if (card.spark) values[`kpi.${card.id}.spark`] = { title: d.kpi.spark };
+	}
+	if (!kpi) {
+		for (const card of KPI_CARDS) {
+			values[`kpi.${card.id}.value`] = F.fmtInt(null);
+			values[`kpi.${card.id}.note`] = "";
+		}
+		patch(runtime.root, values);
+		for (const [, spark] of runtime.sparks) spark.update([]);
+		return;
+	}
+	const calls = F.numOrNull(kpi.calls) ?? 0;
+	const ok = F.numOrNull(kpi.ok) ?? 0;
+	const error = F.numOrNull(kpi.error) ?? 0;
+	const incomplete = F.numOrNull(kpi.incomplete) ?? 0;
+	const aborted = F.numOrNull(kpi.aborted) ?? 0;
+	const denom = Math.max(0, calls - incomplete - aborted);
+	const ttft = kpi.ttft ?? {};
+	const e2e = kpi.e2e ?? {};
+	const cost = kpi.cost ?? {};
+	const tokens = kpi.tokens ?? {};
+	const costAmount = F.numOrNull(cost.amount);
+	const estimateShare = F.numOrNull(cost.estimateShare);
+	const unpriced = F.numOrNull(cost.unpricedCalls) ?? 0;
+	values["kpi.calls.value"] = F.fmtCount(calls);
+	values["kpi.calls.note"] = d.kpi.callsNote(F.fmtCount(ok), F.fmtCount(error));
+	values["kpi.calls.title"] = `${d.kpi.calls}：${F.fmtCount(calls)}（成功 ${F.fmtCount(ok)} · 失败 ${F.fmtCount(error)} · 未收全 ${F.fmtCount(incomplete)} · 取消 ${F.fmtCount(aborted)}）`;
+	values["kpi.successRate.value"] = F.fmtRate(kpi.successRate);
+	values["kpi.successRate.note"] = d.kpi.successNote(F.fmtCount(ok), F.fmtCount(denom));
+	values["kpi.successRate.title"] = d.kpi.successNote(F.fmtCount(ok), F.fmtCount(denom));
+	values["kpi.ttft.value"] = `${F.fmtMs(ttft.p50)} / ${F.fmtMs(ttft.p90)}`;
+	values["kpi.ttft.note"] = d.kpi.ttftNote(F.fmtCount(ttft.samples ?? 0), F.fmtRate(ttft.coverage));
+	values["kpi.ttft.title"] = `${d.kpi.ttftApprox}${ttft.approx === false ? "（exact）" : ""}`;
+	values["kpi.latency.value"] = `${F.fmtMs(e2e.p50)} / ${F.fmtMs(e2e.p90)}`;
+	values["kpi.latency.note"] = d.kpi.latencyNote(F.fmtCount(e2e.samples ?? 0));
+	values["kpi.latency.title"] = d.kpi.latencyNote(F.fmtCount(e2e.samples ?? 0));
+	values["kpi.tokps.value"] = F.fmtTokps(kpi.tokPerSec);
+	values["kpi.tokps.note"] = d.kpi.tokpsNote(F.fmtTokps(kpi.tokPerSecMean), F.fmtCount(kpi.tokPerSecSamples ?? 0));
+	values["kpi.tokps.title"] = d.kpi.tokpsNote(F.fmtTokps(kpi.tokPerSecMean), F.fmtCount(kpi.tokPerSecSamples ?? 0));
+	values["kpi.cost.value"] = F.fmtCost(costAmount, { lowerBound: Boolean(cost.isLowerBound) && unpriced > 0 });
+	values["kpi.cost.note"] = costAmount === null
+		? d.kpi.costNone
+		: d.kpi.costNote(estimateShare === null ? "--" : F.fmtShare(estimateShare), unpriced);
+	values["kpi.cost.title"] = `${d.kpi.cost}：SDK ${F.fmtCost(cost.sdkAmount)} + 估算 ${F.fmtCost(cost.estimatedAmount, { estimate: true })} · token ${F.fmtInt(tokens.total)}`;
+	patch(runtime.root, values);
+
+	const tail = series.slice(-24);
+	runtime.sparks.get("calls")?.update(tail.map((p) => p.calls), "var(--accent, #8b5cf6)");
+	runtime.sparks.get("ttftP50")?.update(tail.map((p) => p.ttftP50), "var(--amber, #f59e0b)");
+	runtime.sparks.get("e2eP50")?.update(tail.map((p) => p.e2eP50), "var(--green, #34d399)");
+	runtime.sparks.get("success")?.update(
+		tail.map((p) => {
+			const calls = F.numOrNull(p.calls) ?? 0;
+			return calls > 0 ? (F.numOrNull(p.ok) ?? 0) / calls : null;
+		}),
+		"var(--green, #34d399)",
+	);
+
+	const sig = [calls, kpi.successRate, ttft.p50, e2e.p50, kpi.tokPerSec, costAmount].join("|");
+	if (sig !== st.ui.kpiSig) {
+		st.ui.kpiSig = sig;
+		patch(runtime.root, {
+			"live.kpi": `${d.a11y.kpiLive}: ${d.kpi.calls} ${F.fmtCount(calls)}, ${d.kpi.successRate} ${F.fmtRate(kpi.successRate)}, TTFT p50 ${F.fmtMs(ttft.p50)}, ${d.kpi.cost} ${F.fmtCost(costAmount)}`,
+		});
+	}
+}
+
+// ──────────────────────────────────────────────────────────── 渲染 · 图表与排行
+
+function renderCharts(d) {
+	const st = runtime.state;
+	const data = st.data;
+	const sig = `${data?.version ?? -1}|${querySig(st.query)}|${st.lang}|${data?.series?.length ?? 0}`;
+	if (sig === runtime.chartSig) return;
+	runtime.chartSig = sig;
+	const gran = data?.range?.gran ?? "1h";
+	const loading = st.phase === "loading";
+	const points = data?.series ?? [];
+	const callsInfo = runtime.charts.calls?.update({ points, gran, d, loading });
+	runtime.charts.latency?.update({ points, gran, d, loading });
+	// 降采样必须在面板上写出来（不能悄悄改口径）
+	const factor = Math.max(callsInfo?.factor ?? 1, 1);
+	patch(runtime.root, {
+		"chart.calls.note": factor > 1 ? `${d.charts.downsample(factor)} · ${d.charts.hint}` : d.charts.hint,
+		"chart.latency.note": factor > 1 ? `${d.charts.downsample(factor)} · ${d.charts.hint}` : d.charts.hint,
+	});
+}
+
+function renderRank(container, items, d, emptyText) {
+	if (!container) return;
+	if (!Array.isArray(items) || !items.length) {
+		clear(container);
+		container.appendChild(h("div", { class: "cps-rank-empty", text: emptyText }));
+		return;
+	}
+	pool(container, items, {
+		key: (item) => String(item?.name ?? ""),
+		create: () => {
+			const name = h("span", { class: "cps-rank-name" });
+			const meta = h("span", { class: "cps-rank-meta" });
+			const track = h("span", { class: "cps-rank-track" }, [h("i")]);
+			return [h("div", { class: "cps-rank-row" }, [name, meta, track])];
+		},
+		update: (nodes, item) => {
+			const row = nodes[0];
+			const name = row.children[0];
+			const meta = row.children[1];
+			const fill = row.children[2].firstChild;
+			setText(name, item?.name ?? "");
+			name.setAttribute("title", String(item?.name ?? ""));
+			const share = F.numOrNull(item?.share) ?? 0;
+			setText(
+				meta,
+				`${F.fmtCount(item?.calls ?? 0)} ${d.top.calls} · ${F.fmtShare(share)} · ${F.fmtCost(item?.cost)} · TTFT ${F.fmtMs(item?.ttftP50)} · ${F.fmtRate(item?.errorRate)}`,
+			);
+			fill.style.width = `${Math.max(0, Math.min(100, share * 100)).toFixed(1)}%`;
+		},
+	});
+}
+
+// ──────────────────────────────────────────────────────────── 渲染 · 明细表
+
+function visibleColumns() {
+	const hidden = new Set(Array.isArray(runtime.state.table.hidden) ? runtime.state.table.hidden : []);
+	const cols = COLUMNS.filter((col) => !hidden.has(col.key));
+	return cols.length ? cols : [COLUMNS[0]];
+}
+
+function sortValue(record, key) {
+	const raw = record?.[key];
+	if (raw === null || raw === undefined) return key === "ts" ? 0 : Number.NEGATIVE_INFINITY;
+	if (typeof raw === "number") return raw;
+	const n = Number(raw);
+	return Number.isFinite(n) ? n : String(raw);
+}
+
+function sortedRecords() {
+	const { key, dir } = runtime.state.query.sort;
+	const rows = [...runtime.state.records.items];
+	const mul = dir === "asc" ? 1 : -1;
+	rows.sort((a, b) => {
+		const av = sortValue(a, key);
+		const bv = sortValue(b, key);
+		if (typeof av === "string" || typeof bv === "string") return String(av).localeCompare(String(bv)) * mul;
+		return (av - bv) * mul;
+	});
+	return rows;
+}
+
+function statusBadgeClass(status) {
+	if (status === "ok") return "cps-badge ok";
+	if (status === "incomplete" || status === "aborted") return "cps-badge warn";
+	if (status === "rate_limited") return "cps-badge warn";
+	if (status) return "cps-badge bad";
+	return "cps-badge mute";
+}
+
+function cellText(record, col, d) {
+	switch (col.key) {
+		case "time":
+			return F.fmtDateTimeLocal(record.ts);
+		case "model":
+			return record.model ?? "--";
+		case "provider":
+			return record.provider ?? "--";
+		case "project":
+			return record.project ?? "--";
+		case "status":
+			return d.statuses[record.status] ?? record.status ?? "--";
+		case "input":
+			return F.fmtInt(record.input);
+		case "output":
+			return F.fmtInt(record.output);
+		case "total":
+			return F.fmtInt(record.total);
+		case "cache":
+			return `${F.fmtInt(record.cacheRead)}/${F.fmtInt(record.cacheWrite)}`;
+		case "cacheHit":
+			return F.fmtRate(record.cacheHitRate);
+		case "ttft":
+			return F.fmtMs(record.ttft);
+		case "gen":
+			return F.fmtMs(record.gen);
+		case "e2e":
+			return F.fmtMs(record.e2e);
+		case "cost":
+			return F.fmtCost(record.cost, { estimate: record.costSource === "estimate" });
+		case "origin":
+			return d.origins[record.origin] ?? record.origin ?? "--";
+		case "session":
+			return record.sessionId ? String(record.sessionId).slice(0, 8) : "--";
+		default:
+			return "";
+	}
+}
+
+function cellTitle(record, col, d) {
+	switch (col.key) {
+		case "cost":
+			return `${d.table.costSource}: ${d.table.costSources[record.costSource] ?? record.costSource ?? "--"}${record.priceId ? ` · ${d.table.priceId} ${record.priceId}` : ""}`;
+		case "cacheHit":
+			return "Σ cache_read ÷ (input + cache_read + cache_write)";
+		case "time":
+			return F.fmtFullLocal(record.ts);
+		case "status":
+			return record.stopReason ? `${d.table.stopReason}: ${record.stopReason}` : "";
+		default:
+			return "";
+	}
+}
+
+function detailText(record, d) {
+	const parts = [
+		`${d.table.detail}: input ${F.fmtInt(record.input)} · output ${F.fmtInt(record.output)} · cacheRead ${F.fmtInt(record.cacheRead)} · cacheWrite ${F.fmtInt(record.cacheWrite)} · reasoning ${F.fmtInt(record.reasoning)} · total ${F.fmtInt(record.total)} · prompt ${F.fmtInt(record.promptTok)}`,
+		`${d.table.origin}: ${d.origins[record.origin] ?? record.origin ?? "--"} · ${d.table.costSource}: ${d.table.costSources[record.costSource] ?? record.costSource ?? "--"}${record.priceId ? ` · ${d.table.priceId} ${record.priceId}` : ""} · ${d.table.stopReason}: ${record.stopReason ?? "--"}`,
+		`${d.table.session}: ${record.sessionId ?? "--"} · ${d.table.recordId}: ${record.id ?? "--"}`,
+	];
+	return parts.join("　|　");
+}
+
+function renderTable(d) {
+	const st = runtime.state;
+	const thead = runtime.root.querySelector('[data-k="table.head"]');
+	const tbody = runtime.root.querySelector('[data-k="table.body"]');
+	if (!thead || !tbody) return;
+	const cols = visibleColumns();
+	let headRow = thead.firstElementChild;
+	if (!headRow) {
+		headRow = h("tr");
+		thead.appendChild(headRow);
+	}
+	const sort = st.query.sort;
+	pool(headRow, cols, {
+		key: (col) => col.key,
+		create: (col) => h("th", { attrs: { scope: "col", "data-col": col.key } }),
+		update: (nodes, col) => {
+			const th = nodes[0];
+			const isSorted = sort.key === col.sort;
+			th.setAttribute("aria-sort", isSorted ? (sort.dir === "asc" ? "ascending" : "descending") : "none");
+			th.setAttribute("title", d.table.sortHint);
+			const arrow = isSorted ? (sort.dir === "asc" ? " ▲" : " ▼") : "";
+			setText(th, `${d.table.cols[col.key] ?? col.key}${arrow}`);
+		},
+	});
+
+	const rows = sortedRecords();
+	const emptyText = (() => {
+		if (st.records.items.length > 0) return "";
+		if (st.records.error) return (d.errors[st.records.error] ?? d.errors.unknown).title;
+		if (st.records.loading) return "";
+		if (!st.data) return d.empty.noImport;
+		if (!(st.data.kpi?.calls > 0)) return d.empty.noCalls;
+		return d.table.empty;
+	})();
+	patch(runtime.root, {
+		"table.empty": { text: emptyText, hidden: Boolean(st.records.items.length) || st.records.loading },
+	});
+	const colSig = cols.map((col) => col.key).join(",");
+	pool(tbody, rows, {
+		key: (record) => String(record.id ?? record.ts),
+		create: () => {
+			const main = h("tr", { attrs: { role: "row", "data-rid": "", tabindex: "0", "aria-expanded": "false" } });
+			const detailCell = h("td");
+			const detail = h("tr", { class: "cps-detail cps-hidden" }, [detailCell]);
+			main.__detail = detail;
+			main.__detailCell = detailCell;
+			main.__colsSig = "";
+			return [main, detail];
+		},
+		update: (nodes, record) => {
+			const main = nodes[0];
+			const detail = main.__detail;
+			const detailCell = main.__detailCell;
+			const expanded = String(st.records.expandedId ?? "") === String(record.id ?? "");
+			main.setAttribute("data-rid", String(record.id ?? ""));
+			main.setAttribute("aria-expanded", expanded ? "true" : "false");
+			if (main.__colsSig !== colSig) {
+				main.__colsSig = colSig;
+				clear(main);
+				for (const col of cols) {
+					const span = h("span");
+					const td = h("td", { class: col.num ? "cps-c-num" : undefined }, [span]);
+					td.setAttribute("data-col", col.key);
+					main.appendChild(td);
+				}
+			}
+			cols.forEach((col, index) => {
+				const td = main.children[index];
+				if (!td) return;
+				const span = td.firstChild;
+				setText(span, cellText(record, col, d));
+				if (col.key === "status") span.className = statusBadgeClass(record.status);
+				else if (span.className) span.className = "";
+				const title = cellTitle(record, col, d);
+				if (title) td.setAttribute("title", title);
+				else td.removeAttribute("title");
+			});
+			detailCell.setAttribute("colspan", String(cols.length));
+			detailCell.textContent = detailText(record, d);
+			detail.classList.toggle("cps-hidden", !expanded);
+		},
+	});
+
+	const count = st.records.items.length;
+	const total = st.records.total;
+	patch(runtime.root, {
+		"table.count": `${d.table.loaded(F.fmtCount(count))}${total ? ` · ${d.table.total(F.fmtCount(total))}` : ""}`,
+		"table.hint": d.table.hint(F.fmtCount(count)),
+		"table.prev": { text: `‹ ${d.table.prev}`, disabled: st.records.stack.length === 0 || st.records.loading },
+		"table.next": { text: `${d.table.next} ›`, disabled: !st.records.nextCursor || st.records.loading },
+		"table.colsPanel": { hidden: !st.table.showCols },
+		"table.colsBtn": { text: d.columns, attrs: { "aria-expanded": st.table.showCols ? "true" : "false" } },
+	});
+	const sizeSelect = runtime.root.querySelector('[data-k="table.pageSize"]');
+	if (sizeSelect) {
+		pool(sizeSelect, TABLE_SIZES, {
+			key: (n) => String(n),
+			create: (n) => h("option", { attrs: { value: String(n) } }),
+			update: (nodes, n) => setText(nodes[0], `${n}${d.table.rowsPerPage}`),
+		});
+		if (sizeSelect.value !== String(st.records.limit)) sizeSelect.value = String(st.records.limit);
+	}
+	const hidden = new Set(st.table.hidden);
+	for (const key of COLUMN_KEYS) {
+		patch(runtime.root, { [`table.col.${key}`]: { value: !hidden.has(key) } });
+	}
+}
+
+// ──────────────────────────────────────────────────────────── 渲染 · 导入 / 页脚
+
+function renderImport(d) {
+	const st = runtime.state;
+	const status = st.importStatus;
+	const phase = status?.phase ?? "idle";
+	const phaseLabel = d.import.phase[phase] ?? phase;
+	const filesTotal = Number(status?.filesTotal) || 0;
+	const filesDone = Number(status?.filesDone) || 0;
+	const rows = Number(status?.rowsTotal) || 0;
+	const running = IMPORT_RUNNING.has(phase);
+	const percent = filesTotal > 0 ? Math.max(0, Math.min(100, Math.round((filesDone / filesTotal) * 100))) : running ? 0 : 0;
+	patch(runtime.root, {
+		"import.phase": phaseLabel,
+		"import.progress": status ? d.import.progress(F.fmtCount(filesDone), F.fmtCount(filesTotal)) : "",
+		"import.rows": status ? d.import.rows(F.fmtCount(rows)) : "",
+		"import.eta": status?.etaMs ? d.import.eta(F.fmtEta(status.etaMs)) : "",
+		"import.bar": {
+			attrs: {
+				"aria-valuenow": String(percent),
+				"aria-valuetext": `${percent}% · ${phaseLabel}`,
+				"aria-label": d.import.barLabel,
+			},
+		},
+		"import.fill": { style: { width: `${percent}%` } },
+		"import.meta": [
+			status?.lastError ? d.import.lastError(status.lastError) : "",
+			status?.finishedAt ? d.import.lastRun(F.fmtDateTimeLocal(status.finishedAt)) : d.import.never,
+			status && status.workerAlive === false ? d.import.workerDown : "",
+		]
+			.filter(Boolean)
+			.join(" · "),
+		"import.start": { hidden: running },
+		"import.pause": { hidden: !(phase === "scanning" || phase === "importing") },
+		"import.resume": { hidden: phase !== "paused" },
+		"import.cancel": { hidden: !running },
+	});
+}
+
+function renderFoot(d) {
+	const st = runtime.state;
+	const data = st.data;
+	if (!data) {
+		patch(runtime.root, { "foot.meta": "" });
+		return;
+	}
+	const range = data.range ?? {};
+	const fresh = data.freshness ?? {};
+	const prices = data.prices ?? {};
+	const coverage = fresh.coverage ?? {};
+	const meta = [
+		`${d.foot.engine} v3`,
+		d.foot.rollup(data.version ?? 0),
+		prices.version ? `${d.foot.prices(prices.version)}${prices.stale ? `（${d.foot.pricesStale}）` : ""}` : d.foot.pricesNever,
+		fresh.ledgerRecords !== undefined ? d.foot.ledger(F.fmtCount(fresh.ledgerRecords)) : "",
+		coverage.eligible ? d.foot.sessions(F.fmtCount(coverage.imported ?? 0), F.fmtCount(coverage.eligible)) : "",
+		range.timezone ? d.foot.tz(`${range.timezone}${range.tzLabel ? ` ${range.tzLabel}` : ""}`) : "",
+		prices.overridesError ? `priceOverrides: ${prices.overridesError}` : "",
+	]
+		.filter(Boolean)
+		.join(" · ");
+	patch(runtime.root, { "foot.meta": meta });
+}
+
+// ──────────────────────────────────────────────────────────── 总渲染
+
+function render() {
+	if (!runtime.root || !runtime.state) return;
+	const st = runtime.state;
+	const d = runtime.d;
+	runtime.root.dataset.phase = st.phase;
+	runtime.root.dataset.hasData = st.data ? "1" : "0";
+	renderTexts(d);
+	renderBanners(d);
+	renderQueryState(d);
+	renderTruth(d);
+	renderKpis(d);
+	renderCharts(d);
+	renderRank(runtime.root.querySelector('[data-k="top.models.list"]'), st.data?.topModels ?? [], d, d.top.empty);
+	renderRank(runtime.root.querySelector('[data-k="top.projects.list"]'), st.data?.topProjects ?? [], d, d.top.empty);
+	renderTable(d);
+	renderImport(d);
+	renderFoot(d);
+}
+
+// ──────────────────────────────────────────────────────────── 交互
+
+function setNotice(text) {
+	const st = runtime.state;
+	st.ui.notice = text;
+	clearTimeout(runtime.noticeTimer);
+	runtime.noticeTimer = setTimeout(() => {
+		st.ui.notice = "";
+		render();
+	}, NOTICE_MS);
+	render();
+}
+
+/** 把 query.from/to 播种到两个日期输入框（只在进入自定义、恢复 URL 时调用）。 */
+function seedCustomInputs() {
+	const st = runtime.state;
+	if (!st) return;
+	const from = runtime.root?.querySelector('[data-k="range.from"]');
+	const to = runtime.root?.querySelector('[data-k="range.to"]');
+	if (from) from.value = st.query.from ?? "";
+	if (to) to.value = st.query.to ?? "";
+}
+
+function setRange(value) {
+	const st = runtime.state;
+	if (value === "custom") {
+		if (!st.query.from || !st.query.to) {
+			const range = st.data?.range;
+			const to = range?.toMs ?? Date.now();
+			const from = range?.fromMs ?? to - 24 * 3_600_000;
+			st.query.from = F.toDateInput(from);
+			st.query.to = F.toDateInput(to);
+		}
+		seedCustomInputs();
+	}
+	if (st.query.range === value) return;
+	st.query.range = value;
+	onQueryChanged();
+}
+
+function applyCustomRange() {
+	const st = runtime.state;
+	const from = runtime.root.querySelector('[data-k="range.from"]')?.value ?? "";
+	const to = runtime.root.querySelector('[data-k="range.to"]')?.value ?? "";
+	st.query.from = from;
+	st.query.to = to;
+	st.query.range = "custom";
+	onQueryChanged();
+}
+
+function setGran(value) {
+	const st = runtime.state;
+	if (st.query.gran === value) return;
+	st.query.gran = value;
+	onQueryChanged();
+}
+
+function setView(value) {
+	const st = runtime.state;
+	if (st.query.view === value) return;
+	st.query.view = value;
+	syncHash();
+	render();
+	if (value === "table") ensureRecords();
+}
+
+function applyFilter(key, value) {
+	const st = runtime.state;
+	const next = value || "all";
+	if (st.query[key] === next) return;
+	st.query[key] = next;
+	onQueryChanged();
+}
+
+function toggleStatusFilter(status) {
+	const st = runtime.state;
+	st.query.status = toggleFilter(st.query.status, status);
+	onQueryChanged();
+}
+
+function clearFilters() {
+	const st = runtime.state;
+	st.query.model = "all";
+	st.query.provider = "all";
+	st.query.project = "all";
+	st.query.status = "all";
+	onQueryChanged();
+}
+
+function toggleSort(key) {
+	const st = runtime.state;
+	const current = st.query.sort;
+	if (!key) return;
+	if (current.key === key) current.dir = current.dir === "asc" ? "desc" : "asc";
+	else {
+		current.key = key;
+		current.dir = key === "ts" ? "desc" : "desc";
+	}
+	syncHash();
+	render();
+}
+
+function toggleColumn(key) {
+	const st = runtime.state;
+	const hidden = new Set(st.table.hidden);
+	if (hidden.has(key)) hidden.delete(key);
+	else hidden.add(key);
+	// 至少留一列，避免表格塌成空行
+	if (hidden.size >= COLUMN_KEYS.length) hidden.delete("time");
+	st.table.hidden = [...hidden].filter((k) => COLUMN_KEYS.includes(k));
+	writeStore(LS_HIDDEN_COLS, st.table.hidden);
+	render();
+}
+
+function toggleRecord(id) {
+	const st = runtime.state;
+	st.records.expandedId = String(st.records.expandedId ?? "") === String(id) ? null : String(id);
+	render();
+}
+
+function nextPage() {
+	const st = runtime.state;
+	if (!st.records.nextCursor || st.records.loading) return;
+	st.records.stack.push(st.records.cursor);
+	void loadRecords({ reset: false, cursor: st.records.nextCursor });
+}
+
+function prevPage() {
+	const st = runtime.state;
+	if (!st.records.stack.length || st.records.loading) return;
+	const cursor = st.records.stack.pop();
+	void loadRecords({ reset: true, cursor });
+}
+
+function exportCsv() {
+	const st = runtime.state;
+	const params = apiParams(st.query);
+	const anchor = document.createElement("a");
+	anchor.href = `${apiBase()}/api/v3/export?format=csv&${params.toString()}`;
+	anchor.download = `usage-ledger-${st.query.range}-${F.toDateInput(Date.now())}.csv`;
+	anchor.rel = "noopener";
+	document.body.appendChild(anchor);
+	anchor.click();
+	anchor.remove();
+	setNotice(runtime.d.notice.exportStarted);
+}
+
+function onClick(event) {
+	const target = event.target instanceof Element ? event.target : null;
+	if (!target || !runtime.root?.contains(target)) return;
+	// 表格行展开（点行内任意位置）
+	const row = target.closest("tr[data-rid]");
+	const inTable = target.closest('[data-k="table.table"]');
+	const header = target.closest("th[data-col]");
+	if (header && inTable) {
+		const col = COLUMNS.find((c) => c.key === header.getAttribute("data-col"));
+		toggleSort(col?.sort);
+		return;
+	}
+	// 点击空白处关闭弹层
+	if (!target.closest(".cps-pop") && !target.closest('[data-act="toggle-status"]')) {
+		if (runtime.state.table.statusOpen || runtime.state.table.showCols) {
+			runtime.state.table.statusOpen = false;
+			runtime.state.table.showCols = false;
+			render();
+		}
+	}
+	// 复选框改由 change 事件处理（click 与 change 都监听会导致「翻两次 = 不变」）
+	const actOnInput = target.getAttribute?.("data-act");
+	if (target.tagName === "INPUT" && (actOnInput === "col" || actOnInput === "status")) return;
+	const actionNode = target.closest("[data-act]");
+	if (!actionNode) {
+		if (row && inTable) toggleRecord(row.getAttribute("data-rid"));
+		return;
+	}
+	const act = actionNode.getAttribute("data-act");
+	const value = actionNode.getAttribute("data-value") ?? "";
+	switch (act) {
+		case "range":
+			setRange(value);
+			return;
+		case "range-apply":
+			applyCustomRange();
+			return;
+		case "gran":
+			setGran(value);
+			return;
+		case "view":
+			setView(value);
+			return;
+		case "refresh":
+			void loadOverview();
+			void loadImportStatus();
+			return;
+		case "export":
+			exportCsv();
+			return;
+		case "toggle-status":
+			runtime.state.table.statusOpen = !runtime.state.table.statusOpen;
+			runtime.state.table.showCols = false;
+			render();
+			return;
+		case "status":
+			toggleStatusFilter(value);
+			return;
+		case "clear-filters":
+			clearFilters();
+			return;
+		case "toggle-cols":
+			runtime.state.table.showCols = !runtime.state.table.showCols;
+			runtime.state.table.statusOpen = false;
+			render();
+			return;
+		case "col":
+			toggleColumn(value);
+			return;
+		case "page-size":
+			return;
+		case "prev-page":
+			prevPage();
+			return;
+		case "next-page":
+			nextPage();
+			return;
+		case "import-start":
+			void postAction("/api/v3/import/start");
+			return;
+		case "import-pause":
+			void postAction("/api/v3/import/pause");
+			return;
+		case "import-resume":
+			void postAction("/api/v3/import/resume");
+			return;
+		case "import-cancel":
+			void postAction("/api/v3/import/cancel");
+			return;
+		case "grant":
+			void postAction("/api/v3/grant", { reload: true });
+			return;
+		default:
+			break;
+	}
+	if (row && inTable) toggleRecord(row.getAttribute("data-rid"));
+}
+
+function onChange(event) {
 	const target = event.target instanceof Element ? event.target : null;
 	if (!target) return;
 	const act = target.getAttribute?.("data-act");
-	if (act !== "pageSize") return;
-	const n = Number(target.value);
-	if (!Number.isFinite(n) || n <= 0) return;
-	runtime.state.pageSize = n;
-	runtime.state.page = 1;
-	void load();
-}
-
-function onRootClick(event) {
-	const target = event.target instanceof Element ? event.target : null;
-	if (!target) return;
-	const actNode = target.closest("[data-act]");
-	if (actNode) {
-		const act = actNode.getAttribute("data-act");
-		const value = actNode.getAttribute("data-value") ?? "";
-		if (act === "refresh") {
-			void load();
-			return;
-		}
-		if (act === "backfill") {
-			void postAction("/api/backfill");
-			return;
-		}
-		if (act === "stopImport") {
-			void postAction("/api/backfill/stop");
-			return;
-		}
-		if (act === "grant") {
-			void postAction("/api/grant");
-			return;
-		}
-		if (act === "refreshPrices") {
-			void postAction("/api/prices/refresh");
-			return;
-		}
-		if (act === "clearModel") {
-			runtime.state.model = "";
-			runtime.state.page = 1;
-			void load();
-			return;
-		}
-		if (act === "window" || act === "bucket" || act === "status") {
-			if (!value || runtime.state[act] === value) return;
-			runtime.state[act] = value;
-			runtime.state.page = 1;
-			void load();
-			return;
-		}
-		if (act === "toggleCols") {
-			runtime.state.showColSettings = !runtime.state.showColSettings;
-			paint();
-			return;
-		}
-		if (act === "col") {
-			const hidden = new Set(Array.isArray(runtime.state.hiddenCols) ? runtime.state.hiddenCols : []);
-			if (hidden.has(value)) hidden.delete(value);
-			else hidden.add(value);
-			// 至少留一列：全关时把「时间」强制打开，避免表格塌成一个空列
-			if (hidden.size >= ALL_COLS.length) hidden.delete("time");
-			runtime.state.hiddenCols = [...hidden];
-			writeHiddenCols(runtime.state.hiddenCols);
-			paint();
-			return;
-		}
-		if (act === "exportCsv") {
-			void exportCsv();
-			return;
-		}
-		if (act === "page") {
-			const next = Number(value);
-			if (!Number.isFinite(next) || next === runtime.state.page) return;
-			runtime.state.page = Math.max(1, Math.min(runtime.state.pages || 1, Math.trunc(next)));
-			void load();
-			return;
-		}
-	}
-	const modelRow = target.closest("tr[data-model]");
-	if (modelRow) {
-		const model = modelRow.getAttribute("data-model") ?? "";
-		runtime.state.model = runtime.state.model === model ? "" : model;
-		runtime.state.page = 1;
-		void load();
+	if (act === "filter-model" || act === "filter-provider" || act === "filter-project") {
+		applyFilter(act.replace("filter-", ""), target.value);
 		return;
 	}
-	const row = target.closest("tr[data-rid]");
-	if (row) {
-		const id = row.getAttribute("data-rid") ?? "";
-		runtime.state.expandedId = runtime.state.expandedId === id ? null : id;
-		paint();
+	if (act === "page-size") {
+		const size = Number(target.value);
+		if (!TABLE_SIZES.includes(size)) return;
+		runtime.state.records.limit = size;
+		void loadRecords({ reset: true, cursor: null });
+		return;
+	}
+	if (act === "col") {
+		const key = target.getAttribute("data-value");
+		if (key) toggleColumn(key);
+		return;
+	}
+	if (act === "status") {
+		const value = target.getAttribute("data-value");
+		if (value) toggleStatusFilter(value);
 	}
 }
 
-function startTimer() {
-	stopTimer();
-	runtime.timer = setInterval(() => {
-		// 视图切走时宿主只 display:none（不卸载）：没必要为了看不见的看板打请求
-		if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-		if (!runtime.container || !runtime.container.isConnected) return;
-		if (!runtime.root || runtime.root.offsetParent === null) {
-			// offsetParent 变 null = 宿主已把视图隐藏：彻底停掉定时器，靠视图观察器恢复
-			if (!runtime.viewObserver) stopTimer();
+function onKeyDown(event) {
+	const target = event.target instanceof Element ? event.target : null;
+	if (!target) return;
+	// tablist 方向键切换（自动激活，符合 WAI-ARIA tabs 模式）
+	const group = target.closest('[role="tablist"]');
+	if (group && target.getAttribute("role") === "tab") {
+		const tabs = [...group.querySelectorAll('[role="tab"]')];
+		const index = tabs.indexOf(target);
+		if (index < 0) return;
+		let next = -1;
+		if (event.key === "ArrowRight" || event.key === "ArrowDown") next = (index + 1) % tabs.length;
+		else if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = (index - 1 + tabs.length) % tabs.length;
+		else if (event.key === "Home") next = 0;
+		else if (event.key === "End") next = tabs.length - 1;
+		else if (event.key === "Enter" || event.key === " ") next = index;
+		if (next < 0) return;
+		event.preventDefault();
+		const tab = tabs[next];
+		tab.focus();
+		tab.click();
+		return;
+	}
+	// 表格行：Enter/Space 展开
+	const row = target.closest?.("tr[data-rid]");
+	if (row && (event.key === "Enter" || event.key === " ")) {
+		event.preventDefault();
+		toggleRecord(row.getAttribute("data-rid"));
+	}
+}
+
+// ──────────────────────────────────────────────────────────── 轮询与观察器
+
+function scheduleOverviewPoll(delay) {
+	clearTimeout(runtime.pollTimer);
+	runtime.pollTimer = setTimeout(() => {
+		runtime.pollTimer = null;
+		if (!runtime.mounted) return;
+		if (document.visibilityState === "hidden" || !viewVisible()) {
+			scheduleOverviewPoll(POLL_HIDDEN_MS);
 			return;
 		}
-		void load();
-	}, REFRESH_MS);
+		void loadOverview();
+		scheduleOverviewPoll(POLL_VISIBLE_MS);
+	}, delay);
 }
 
-/** 视图可见性观察器：宿主切走视图时停定时器，切回时补一次刷新并恢复轮询。
- *  没有 IntersectionObserver（极老浏览器）时静默不做，回退到定时器内的 offsetParent 早退。 */
-function ensureViewObserver() {
-	if (runtime.viewObserver || typeof IntersectionObserver === "undefined") return;
-	const target = runtime.root;
-	if (!target) return;
+/** 宿主把非当前视图留在 DOM 里（display:none），别为看不见的看板打请求。 */
+function viewVisible() {
 	try {
-		runtime.viewObserver = new IntersectionObserver((entries) => {
-			const visible = entries.some((e) => e.isIntersecting);
-			if (visible) {
-				if (!runtime.timer) {
-					startTimer();
-					void load();
-				}
-			} else {
-				stopTimer();
-			}
-		});
-		runtime.viewObserver.observe(target);
+		const root = runtime.root;
+		if (!root || !root.isConnected) return false;
+		if (typeof root.checkVisibility === "function") return root.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true });
+		return true;
 	} catch {
-		/* 观察器不可用：保持原有定时器行为 */
-		runtime.viewObserver = null;
+		return true;
 	}
 }
 
-function stopViewObserver() {
+function scheduleImportPoll(delay) {
+	clearTimeout(runtime.importTimer);
+	runtime.importTimer = setTimeout(() => {
+		runtime.importTimer = null;
+		if (!runtime.mounted) return;
+		void loadImportStatus().then(() => {
+			if (!runtime.mounted) return;
+			// 运行中 2s、空闲 30s；页面不可见时一律退到 30s
+			const next = document.visibilityState === "hidden" ? POLL_IMPORT_IDLE_MS : isImportRunning() ? POLL_IMPORT_RUNNING_MS : POLL_IMPORT_IDLE_MS;
+			scheduleImportPoll(next);
+		});
+	}, delay);
+}
+
+/** 滚到底部才拉明细（首屏不发第三个请求）。 */
+function ensureSentinelObserver() {
+	const sentinel = runtime.root?.querySelector('[data-k="records.sentinel"]');
+	if (!sentinel || typeof IntersectionObserver === "undefined") return;
+	let first = true;
 	try {
-		runtime.viewObserver?.disconnect();
+		runtime.sentinelObserver = new IntersectionObserver((entries) => {
+			// 首次回调只反映挂载瞬间的可见性，不能当成「用户滚到底部」
+			if (first) {
+				first = false;
+				return;
+			}
+			if (entries.some((entry) => entry.isIntersecting)) ensureRecords();
+		});
+		runtime.sentinelObserver.observe(sentinel);
+	} catch {
+		runtime.sentinelObserver = null;
+	}
+}
+
+function stopSentinelObserver() {
+	try {
+		runtime.sentinelObserver?.disconnect();
 	} catch {
 		/* ignore */
 	}
-	runtime.viewObserver = null;
+	runtime.sentinelObserver = null;
 }
 
-function stopTimer() {
-	if (runtime.timer) {
-		clearInterval(runtime.timer);
-		runtime.timer = null;
+function onVisibilityChange() {
+	if (!runtime.mounted) return;
+	if (document.visibilityState === "visible") {
+		void loadOverview();
+		void loadImportStatus();
 	}
 }
 
 function applyLang() {
+	if (!runtime.mounted) return;
 	const next = detectLang();
-	if (next === runtime.state.lang && runtime.root?.childElementCount) {
-		// 语言没变且已渲染：不重画（避免滚动位置丢失）
-		if (runtime.state.summary || runtime.state.error) return;
-	}
+	if (next === runtime.state.lang) return;
 	runtime.state.lang = next;
-	paint();
+	runtime.d = dict(next);
+	runtime.chartSig = "";
+	render();
 }
 
-function mount(container) {
-	if (!container) return () => {};
-	ensureStyles();
-	runtime.container = container;
-	// 新挂载 = 新视图：瞬时状态与上一轮数据一律清掉（否则会沿用旧看板的
-	// loading/展开行/数据，甚至把按钮永久 disabled）
-	runtime.state.loading = false;
-	runtime.state.error = null;
-	runtime.state.expandedId = null;
-	runtime.state.summary = null;
-	runtime.state.models = null;
-	runtime.state.series = null;
-	runtime.state.records = null;
-	runtime.state.meta = null;
-	runtime.state.lang = detectLang();
-	runtime.root = document.createElement("div");
-	runtime.root.className = "cps-root";
-	runtime.root.addEventListener("click", onRootClick);
-	runtime.root.addEventListener("change", onRootChange);
-	container.appendChild(runtime.root);
-	paint();
-	void load();
-	startTimer();
-	ensureViewObserver();
-	// 跟随宿主语言切换（宿主会改 documentElement.lang）
+// ──────────────────────────────────────────────────────────── 生命周期
+
+function readHiddenCols() {
+	const stored = readStore(LS_HIDDEN_COLS, []);
+	const list = Array.isArray(stored) ? stored.filter((key) => COLUMN_KEYS.includes(key)) : [];
+	return list.length >= COLUMN_KEYS.length ? [] : list;
+}
+
+function bind(container) {
+	const st = runtime.state;
+	const root = h("div", { class: "cps-root", attrs: { "data-phase": "loading" } });
+	runtime.root = root;
+	container.appendChild(root);
+	runtime.refs = buildSkeleton(root);
+
+	runtime.charts.calls = createChart(runtime.refs.chartCalls, {
+		key: "calls",
+		kind: "bars",
+		titleKey: "callsTitle",
+		yKind: "count",
+		series: CHART_CALLS_SERIES,
+	});
+	runtime.charts.latency = createChart(runtime.refs.chartLatency, {
+		key: "latency",
+		kind: "lines",
+		titleKey: "latencyTitle",
+		yKind: "ms",
+		series: CHART_LATENCY_SERIES,
+	});
+	runtime.sparks.clear();
+	for (const [key, host] of runtime.refs.sparks) runtime.sparks.set(key, createSparkline(host));
+
+	const add = (target, type, handler, options) => {
+		target.addEventListener(type, handler, options);
+		runtime.cleanups.push(() => target.removeEventListener(type, handler, options));
+	};
+	add(root, "click", onClick);
+	add(root, "change", onChange);
+	add(root, "keydown", onKeyDown);
+	add(document, "visibilitychange", onVisibilityChange);
+	add(window, "hashchange", applyHash);
+
+	// 语言：宿主 onLocale 优先，documentElement.lang 变化兜底
 	try {
 		const host = window.__piWebUiHost;
 		if (host && typeof host.onLocale === "function") {
-			runtime.offLocale = host.onLocale(() => applyLang());
+			const off = host.onLocale(() => applyLang());
+			if (typeof off === "function") runtime.offLocale = off;
 		}
+		if (host && typeof host.onViewChange === "function") {
+			const off = host.onViewChange((view) => {
+				if (view === VIEW_NAME && runtime.mounted) {
+					void loadOverview();
+					void loadImportStatus();
+				}
+			});
+			if (typeof off === "function") runtime.offViewChange = off;
+		}
+	} catch {
+		/* 宿主没提供对应钩子：仅靠 lang 观察器 */
+	}
+	if (typeof MutationObserver !== "undefined") {
 		runtime.langObserver = new MutationObserver(() => applyLang());
 		runtime.langObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["lang"] });
-	} catch {
-		/* 没有 MutationObserver / 宿主不提供 onLocale：不跟随，纯静态文案 */
 	}
-	return () => {
-		stopTimer();
-		stopViewObserver();
+
+	st.lang = detectLang();
+	runtime.d = dict(st.lang);
+	render();
+
+	// 首屏：只发 overview + import/status（表格视图从 URL 恢复时才补 records）
+	void loadOverview();
+	void loadImportStatus();
+	if (st.query.view === "table") ensureRecords();
+	ensureSentinelObserver();
+	scheduleOverviewPoll(POLL_VISIBLE_MS);
+	scheduleImportPoll(POLL_IMPORT_RUNNING_MS);
+	seedCustomInputs();
+	syncHash();
+}
+
+/**
+ * 挂载看板。
+ * @param {HTMLElement} container 宿主给的普通 div
+ * @returns {() => void} cleanup
+ */
+export function mount(container) {
+	if (!container) return () => {};
+	// 宿主若在同一容器上重复 mount（视图重建），先收掉旧实例：runtime 是模块级单例
+	if (typeof runtime.activeCleanup === "function") {
 		try {
-			runtime.inflight?.abort();
+			runtime.activeCleanup();
+		} catch {
+			/* 旧实例已坏：继续挂新的 */
+		}
+		runtime.activeCleanup = null;
+	}
+	ensureStyles();
+	const parsed = parseHash(typeof location !== "undefined" ? location.hash : "");
+	runtime.state = createState({ lang: detectLang(), query: parsed.query, hidden: readHiddenCols() });
+	runtime.mounted = true;
+	runtime.chartSig = "";
+	bind(container);
+
+	const cleanup = () => {
+		runtime.mounted = false;
+		for (const fn of runtime.cleanups.splice(0)) {
+			try {
+				fn();
+			} catch {
+				/* ignore */
+			}
+		}
+		clearTimeout(runtime.pollTimer);
+		clearTimeout(runtime.importTimer);
+		clearTimeout(runtime.noticeTimer);
+		runtime.pollTimer = null;
+		runtime.importTimer = null;
+		runtime.noticeTimer = null;
+		stopSentinelObserver();
+		try {
+			runtime.overviewCtl?.abort();
+			runtime.recordsCtl?.abort();
 		} catch {
 			/* ignore */
 		}
-		runtime.inflight = null;
-		runtime.state.loading = false;
+		runtime.overviewCtl = null;
+		runtime.recordsCtl = null;
 		try {
 			runtime.offLocale?.();
+			runtime.offViewChange?.();
 		} catch {
 			/* ignore */
 		}
 		runtime.offLocale = null;
+		runtime.offViewChange = null;
 		try {
 			runtime.langObserver?.disconnect();
 		} catch {
 			/* ignore */
 		}
 		runtime.langObserver = null;
+		for (const chart of Object.values(runtime.charts)) {
+			try {
+				chart?.destroy?.();
+			} catch {
+				/* ignore */
+			}
+		}
+		runtime.charts = { calls: null, latency: null };
+		runtime.sparks.clear();
 		try {
-			runtime.root?.removeEventListener("click", onRootClick);
-			runtime.root?.removeEventListener("change", onRootChange);
 			runtime.root?.remove();
 		} catch {
 			/* ignore */
 		}
 		runtime.root = null;
-		runtime.container = null;
+		runtime.refs = null;
+		runtime.state = null;
+		runtime.chartSig = "";
+		if (runtime.activeCleanup === cleanup) runtime.activeCleanup = null;
 	};
+	runtime.activeCleanup = cleanup;
+	return cleanup;
 }
 
-/** 底栏徽标点击 → 切到本插件视图（宿主动作，不改宿主 DOM）。 */
+/** 底栏徽标（`usage-ledger:open`）→ 切到本插件视图（走宿主 setView，不碰宿主 DOM）。 */
 function openView() {
 	try {
 		window.__piWebUiHost?.setView?.(VIEW_NAME);
 	} catch {
-		/* 宿主没提供 setView（旧版本）：静默失败，不抛错 */
+		/* 宿主没有 setView（旧版本）：静默失败 */
 	}
 }
 
 function register() {
 	try {
 		const host = window.__piWebUiHost;
-		if (host && typeof host.onUiAction === "function") {
-			host.onUiAction(ACTION_OPEN, () => openView());
-		}
+		if (host && typeof host.onUiAction === "function") host.onUiAction(ACTION_OPEN, () => openView());
 	} catch {
 		/* ignore */
 	}
 }
 
 if (typeof window !== "undefined") {
-	if (document.readyState === "loading") {
-		document.addEventListener("DOMContentLoaded", register, { once: true });
-	} else {
-		register();
-	}
+	if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", register, { once: true });
+	else register();
 }
 
-export default {
-	mount,
-};
+export default { mount };

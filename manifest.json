@@ -2,17 +2,18 @@
 	"id": "usage-ledger",
 	"name": "用量账本",
 	"nameEn": "Usage Ledger",
-	"version": "2.1.1",
+	"version": "3.0.0",
 	"author": "JSJ189",
 	"homepage": "https://github.com/JSJ189/usage-ledger",
 	"license": "MIT",
 	"icon": "📊",
 	"iconSvg": "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M3 3v18h18\"/><rect x=\"7\" y=\"12\" width=\"3\" height=\"6\"/><rect x=\"12\" y=\"8\" width=\"3\" height=\"10\"/><rect x=\"17\" y=\"5\" width=\"3\" height=\"13\"/></svg>",
-	"description": "记录 pi-web-ui 自己的每一次模型调用：按模型统计调用数、成功率、TTFT 分位、单次耗时、总输出÷总耗时的吞吐、缓存命中率、token 用量与成本。成本优先用 SDK 的 usage.cost.total；网关不回填时按公开价格表（models.dev / LiteLLM / OpenRouter，缓存 7 天）估算，并把 SDK 与估算分开展示。数据来自运行轨迹事件与本机会话 JSONL，不读任何代理账本。底栏显示今日调用数与 TTFT p50，点击打开看板。",
-	"descriptionEn": "Records pi-web-ui's own model calls: per-model call counts, success rate, TTFT percentiles, latency, throughput (total output ÷ total time), cache hit rate, token usage and cost. Cost prefers the SDK's usage.cost.total; when the gateway reports 0 it is estimated from public price tables (models.dev / LiteLLM / OpenRouter, cached for 7 days) and SDK vs estimated amounts are shown separately. Data comes from run-trace events plus local session JSONL files, with no proxy ledger. The bottom bar shows today's call count and TTFT p50; click for the dashboard.",
+	"description": "记录 pi-web-ui 自己的每一次模型调用：范围切换毫秒级（预聚合 + SQLite），按模型/供应商/项目统计调用数、成功率、TTFT 与总耗时分位、加权吞吐、缓存命中率、token 与成本；历史会话在后台线程导入，可暂停/继续，导入期间看板照常可用。成本优先用 SDK 值，缺价按公开价格表估算并分开展示。数据只在本机。",
+	"descriptionEn": "Records every model call inside pi-web-ui with millisecond range switching (pre-aggregated rollups + SQLite): calls, success rate, TTFT and end-to-end percentiles, weighted throughput, cache hit rate, tokens and cost by model/provider/project. History is imported in a worker thread with pause/resume while the dashboard stays usable. Cost prefers SDK values and falls back to public price tables, shown separately. Everything stays local.",
 	"apiVersion": 2,
 	"view": false,
 	"preload": true,
+	"alwaysOn": true,
 	"permissions": ["ui", "http", "fs:read"],
 	"settings": [
 		{
@@ -20,21 +21,28 @@
 			"type": "text",
 			"label": "会话目录 (Sessions directory)",
 			"default": "",
-			"hint": "pi 会话 JSONL 所在目录的绝对路径，用于回填历史 token / 成本 / 耗时。留空 = 自动：$PI_CODING_AGENT_DIR/sessions → ~/.pi/agent/sessions。插件只读该目录，绝不写入。"
+			"hint": "pi 会话 JSONL 所在目录的绝对路径，用于导入历史 token / 成本 / 耗时。留空 = 自动：$PI_CODING_AGENT_DIR/sessions → ~/.pi/agent/sessions。插件只读该目录，绝不写入。"
 		},
 		{
 			"key": "backfillDays",
 			"type": "text",
-			"label": "回填天数 (Backfill days)",
+			"label": "导入天数 (Import days)",
 			"default": "30",
-			"hint": "只回填修改时间在最近 N 天内的会话文件（默认 30，夹取 1–3650）。改大可以导入更早的历史，代价是首次回填更久。"
+			"hint": "只导入修改时间在最近 N 天内的会话文件（默认 30，夹取 1–3650）。改大可以导入更早的历史，代价是首次导入更久。"
+		},
+		{
+			"key": "autoImport",
+			"type": "boolean",
+			"label": "自动导入历史 (Auto import)",
+			"default": true,
+			"hint": "插件激活后在后台线程增量导入会话历史；关掉后只能在看板里手动点「导入」。导入永远在 worker 里跑，不会卡住 pi-web-ui。"
 		},
 		{
 			"key": "backfillOnStart",
 			"type": "boolean",
-			"label": "启动时回填 (Backfill on start)",
+			"label": "启动时立即导入 (Import on start)",
 			"default": true,
-			"hint": "插件激活时立刻跑一次增量回填；关掉后只在每 5 分钟的定时任务或点看板「回填」时跑。"
+			"hint": "激活时立刻跑一轮增量导入（需要 autoImport 打开）。关掉后只在每 30 分钟的定时检查或有新会话时导入。"
 		},
 		{
 			"key": "priceOverrides",
@@ -57,8 +65,8 @@
 				"align": "start",
 				"order": 17,
 				"badge": "--",
-				"hint": "📊 用量账本：今日调用数 / TTFT p50（没有 fs:read 时显示「仅实时」；点击打开看板）",
-				"hintEn": "📊 Usage Ledger: today's calls / TTFT p50 (shows \"live only\" without fs:read; click to open the dashboard)"
+				"hint": "📊 用量账本：今日调用数 / TTFT p50（点击打开看板）",
+				"hintEn": "📊 Usage Ledger: today's calls / TTFT p50 (click to open the dashboard)"
 			}
 		],
 		"topbar.primary": [

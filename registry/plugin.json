@@ -3,8 +3,8 @@
 	"name": "用量账本",
 	"source": "JSJ189/usage-ledger",
 	"author": "JSJ189",
-	"description": "记录 pi-web-ui 自己的每一次模型调用：按模型统计调用数、TTFT、延迟、吞吐、缓存命中率、token 与成本，可查看逐条记录、按模型筛选并导出 CSV。成本优先用 SDK 记录，网关不回填时按公开价格表估算并分开展示；数据只来自本机会话与运行事件，不上传任何内容。",
-	"descriptionEn": "Records every model call inside pi-web-ui: per-model counts, TTFT, latency, throughput, cache hit rate, tokens and cost. Cost prefers the SDK value and falls back to public price tables when the gateway reports zero, shown separately; data comes only from local sessions and run events.",
+	"description": "记录 pi-web-ui 自己的每一次模型调用：范围切换毫秒级（预聚合 + SQLite），按模型/供应商/项目统计调用数、成功率、TTFT 与总耗时分位、加权吞吐、缓存命中率、token 与成本；历史会话在后台线程导入，可暂停/继续，导入期间看板照常可用。成本优先用 SDK 值，缺价按公开价格表估算并分开展示。数据只在本机。",
+	"descriptionEn": "Records every model call inside pi-web-ui: millisecond range switching (rollup + SQLite), calls, success rate, TTFT/end-to-end percentiles, throughput, cache hit rate, tokens and cost by model/provider/project. History imports in a worker thread; cost prefers SDK values. Local only.",
 	"homepage": "https://github.com/JSJ189/usage-ledger",
 	"icon": "📊",
 	"tags": [
@@ -13,6 +13,8 @@
 		"TTFT",
 		"延迟",
 		"成本",
-		"observability"
+		"observability",
+		"SQLite",
+		"导入"
 	]
 }
