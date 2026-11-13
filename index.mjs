@@ -465,6 +465,7 @@ export function activate(host) {
 				gran,
 				filters: storeFilters(filters),
 				maxBuckets: 720,
+				topLimit: 50,
 			});
 			return {
 				ok: true,
@@ -577,7 +578,8 @@ export function activate(host) {
 		guard(async () => {
 			if (!priceBook) return { ok: false, code: "no-prices", reason: "价格表不可用" };
 			const status = await priceBook.refresh();
-			return { ok: true, prices: status };
+			importer?.reprice?.();
+			return { ok: true, prices: status, repricing: true };
 		}),
 	);
 
@@ -809,9 +811,10 @@ export function activate(host) {
 						version: priceBook?.version ?? null,
 						fetchedAt: s.fetchedAt ?? null,
 						stale: s.stale === true,
-						entries: s.entries ?? 0,
-						overridesError: s.overridesError ?? null,
-						failed: s.failed ?? [],
+					entries: s.entries ?? 0,
+					overridesError: s.overridesError ?? null,
+					failed: s.failed ?? [],
+					sources: Array.isArray(s.sources) ? s.sources : [],
 					}
 				: null;
 		} catch {

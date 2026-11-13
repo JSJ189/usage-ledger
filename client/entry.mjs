@@ -316,6 +316,15 @@ async function postAction(path, opts = {}) {
 	if (opts.reload) void loadOverview();
 }
 
+async function refreshPrices() {
+	setNotice(runtime.d?.foot?.pricesRefreshing ?? "");
+	await postAction("/api/v3/prices/refresh", { reload: true });
+	// 回填在 worker 里跑，接口先返回。过几秒再拉一次，金额才会出现在卡片上。
+	setTimeout(() => {
+		if (runtime.mounted) void loadOverview();
+	}, 8000);
+}
+
 // ──────────────────────────────────────────────────────────── URL 状态
 
 function syncHash() {
@@ -399,6 +408,18 @@ function renderTexts(d) {
 		"chart.latency.note": d.charts.hint,
 		"top.models.title": d.top.models,
 		"top.projects.title": d.top.projects,
+		"tokens.title": d.top.tokensTitle,
+		"tokens.hint": d.top.tokensHint,
+		"tokens.th.model": d.top.model,
+		"tokens.th.calls": d.top.calls,
+		"tokens.th.input": d.top.input,
+		"tokens.th.output": d.top.output,
+		"tokens.th.cacheRead": d.top.cacheRead,
+		"tokens.th.cacheWrite": d.top.cacheWrite,
+		"tokens.th.total": d.top.total,
+		"tokens.th.cost": d.top.cost,
+		"prices.title": d.prices.title,
+		"prices.refresh": d.foot.pricesRefresh,
 		"table.title": d.table.title,
 		"import.title": d.import.title,
 		"import.start": d.import.start,
@@ -437,15 +458,19 @@ function renderQueryState(d) {
 	const q = st.query;
 	renderSegment("range", RANGES, q.range, d.ranges);
 	renderSegment("gran", GRANS, q.gran, d.grans);
-	renderSegment("view", VIEWS, q.view, { chart: d.viewChart, table: d.viewTable });
+	renderSegment("view", VIEWS, q.view, { chart: d.viewChart, table: d.viewTable, prices: d.viewPrices });
 	patch(runtime.root, { "range.custom": { hidden: q.range !== "custom" } });
 	// 日期输入框是「草稿」：只在进入自定义/恢复 URL 时播种，渲染不再回写，
 	// 否则用户一边输入就被 patch 覆盖（排序/刷新任一帧都会触发）。
 	// 明细视图开关
 	const chartView = runtime.root.querySelector('[data-k="view.chart"]');
 	const tableView = runtime.root.querySelector('[data-k="view.table"]');
+	const pricesView = runtime.root.querySelector('[data-k="view.prices"]');
 	if (chartView) chartView.classList.toggle("cps-hidden", q.view !== "chart");
 	if (tableView) tableView.classList.toggle("cps-hidden", q.view !== "table");
+	if (pricesView) pricesView.classList.toggle("cps-hidden", q.view !== "prices");
+	const tokenPanel = runtime.root.querySelector('[data-k="tokens.panel"]');
+	if (tokenPanel) tokenPanel.classList.toggle("cps-hidden", q.view !== "chart");
 	renderFilters(d);
 }
 
@@ -664,7 +689,96 @@ function renderRank(container, items, d, emptyText) {
 				meta,
 				`${F.fmtCount(item?.calls ?? 0)} ${d.top.calls} · ${F.fmtShare(share)} · ${F.fmtCost(item?.cost)} · TTFT ${F.fmtMs(item?.ttftP50)} · ${F.fmtRate(item?.errorRate)}`,
 			);
-			fill.style.width = `${Math.max(0, Math.min(100, share * 100)).toFixed(1)}%`;
+		fill.style.width = `${Math.max(0, Math.min(100, share * 100)).toFixed(1)}%`;
+		},
+	});
+}
+
+function renderModelTokens(d) {
+	const body = runtime.root?.querySelector('[data-k="tokens.body"]');
+	const empty = runtime.root?.querySelector('[data-k="tokens.empty"]');
+	if (!body) return;
+	const items = runtime.state?.data?.topModels ?? [];
+	if (!items.length) {
+		clear(body);
+		if (empty) {
+			empty.hidden = false;
+			setText(empty, d.top.empty);
+		}
+		return;
+	}
+	if (empty) empty.hidden = true;
+	pool(body, items, {
+		key: (item) => String(item?.name ?? ""),
+		create: () => {
+			const cells = ["model", "calls", "input", "output", "cacheRead", "cacheWrite", "total", "cost"].map((key) =>
+				h("td", { attrs: { "data-col": key } }),
+			);
+			return [h("tr", {}, cells)];
+		},
+		update: (nodes, item) => {
+			const cells = nodes[0].children;
+			const tok = item?.tokens ?? {};
+			const values = [
+				item?.name ?? "",
+				F.fmtCount(item?.calls),
+				F.fmtInt(tok.input),
+				F.fmtInt(tok.output),
+				F.fmtInt(tok.cacheRead),
+				F.fmtInt(tok.cacheWrite),
+				F.fmtInt(tok.total),
+				F.fmtCost(item?.cost),
+			];
+			const exact = [
+				item?.name ?? "",
+				F.fmtCount(item?.calls),
+				F.fmtCount(tok.input),
+				F.fmtCount(tok.output),
+				F.fmtCount(tok.cacheRead),
+				F.fmtCount(tok.cacheWrite),
+				F.fmtCount(tok.total),
+				F.fmtCost(item?.cost),
+			];
+			for (let i = 0; i < cells.length; i++) {
+				setText(cells[i], values[i]);
+				cells[i].setAttribute("title", exact[i]);
+			}
+			cells[6].classList.add("cps-tok-total");
+		},
+	});
+}
+
+function renderPriceSources(d) {
+	const box = runtime.root?.querySelector('[data-k="prices.sources"]');
+	if (!box) return;
+	const prices = runtime.state?.data?.prices ?? {};
+	const when = prices.fetchedAt ? F.fmtDateTimeLocal(prices.fetchedAt) : d.foot.pricesNever;
+	const summary =
+		prices.version && prices.entries
+			? d.prices.summary(prices.version, F.fmtCount(prices.entries), when)
+			: d.prices.never;
+	patch(runtime.root, { "prices.summary": summary });
+	const sources = Array.isArray(prices.sources) ? prices.sources : [];
+	if (!sources.length) {
+		clear(box);
+		box.appendChild(h("div", { class: "cps-rank-empty", text: d.prices.empty }));
+		return;
+	}
+	pool(box, sources, {
+		key: (src) => String(src?.id ?? src?.label ?? ""),
+		create: () => {
+			const name = h("span", { class: "cps-rank-name" });
+			const meta = h("span", { class: "cps-rank-meta" });
+			return [h("div", { class: "cps-rank-row" }, [name, meta])];
+		},
+		update: (nodes, src) => {
+			const row = nodes[0];
+			setText(row.children[0], src?.label || src?.id || "");
+			const state = src?.ok ? d.prices.ok : d.prices.failed;
+			const err = src?.error ? ` · ${src.error}` : "";
+			setText(row.children[1], `${state} · ${d.prices.rows} ${F.fmtCount(src?.count ?? 0)}${err}`);
+		row.children[1].classList.toggle("cps-src-ok", Boolean(src?.ok));
+		row.children[1].classList.toggle("cps-src-bad", !src?.ok);
 		},
 	});
 }
@@ -888,8 +1002,10 @@ function renderImport(d) {
 	const filesDone = Number(status?.filesDone) || 0;
 	const rows = Number(status?.rowsTotal) || 0;
 	const running = IMPORT_RUNNING.has(phase);
+	const showPanel = running || phase === "migrating" || phase === "error" || phase === "recalc";
 	const percent = filesTotal > 0 ? Math.max(0, Math.min(100, Math.round((filesDone / filesTotal) * 100))) : running ? 0 : 0;
 	patch(runtime.root, {
+		"import.panel": { hidden: !showPanel },
 		"import.phase": phaseLabel,
 		"import.progress": status ? d.import.progress(F.fmtCount(filesDone), F.fmtCount(filesTotal)) : "",
 		"import.rows": status ? d.import.rows(F.fmtCount(rows)) : "",
@@ -930,7 +1046,6 @@ function renderFoot(d) {
 	const meta = [
 		`${d.foot.engine} v3`,
 		d.foot.rollup(data.version ?? 0),
-		prices.version ? `${d.foot.prices(prices.version)}${prices.stale ? `（${d.foot.pricesStale}）` : ""}` : d.foot.pricesNever,
 		fresh.ledgerRecords !== undefined ? d.foot.ledger(F.fmtCount(fresh.ledgerRecords)) : "",
 		coverage.eligible ? d.foot.sessions(F.fmtCount(coverage.imported ?? 0), F.fmtCount(coverage.eligible)) : "",
 		range.timezone ? d.foot.tz(`${range.timezone}${range.tzLabel ? ` ${range.tzLabel}` : ""}`) : "",
@@ -957,6 +1072,8 @@ function render() {
 	renderCharts(d);
 	renderRank(runtime.root.querySelector('[data-k="top.models.list"]'), st.data?.topModels ?? [], d, d.top.empty);
 	renderRank(runtime.root.querySelector('[data-k="top.projects.list"]'), st.data?.topProjects ?? [], d, d.top.empty);
+	renderModelTokens(d);
+	renderPriceSources(d);
 	renderTable(d);
 	renderImport(d);
 	renderFoot(d);
@@ -1155,6 +1272,9 @@ function onClick(event) {
 		case "refresh":
 			void loadOverview();
 			void loadImportStatus();
+			return;
+		case "prices-refresh":
+			void refreshPrices();
 			return;
 		case "export":
 			exportCsv();

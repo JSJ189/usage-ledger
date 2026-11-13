@@ -11,7 +11,7 @@ import { fromDateInput } from "./format.mjs";
 
 export const RANGES = ["today", "24h", "7d", "30d", "90d", "all", "custom"];
 export const GRANS = ["auto", "5m", "1h", "1d"];
-export const VIEWS = ["chart", "table"];
+export const VIEWS = ["chart", "table", "prices"];
 /** 六态（顺序即 UI 顺序，与 docs §三 schema 一致）。 */
 export const STATUSES = ["ok", "client_error", "rate_limited", "provider_error", "aborted", "incomplete"];
 /** 表格列（顺序即渲染顺序）。 */

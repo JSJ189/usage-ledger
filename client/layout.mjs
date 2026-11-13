@@ -237,16 +237,21 @@ const CSS = `
 .cps-foot { color: var(--text-faint, #6b7080); font-size: 11px; overflow-wrap: anywhere; display: flex; gap: 4px 12px; flex-wrap: wrap; }
 .cps-foot code { font-size: 11px; }
 .cps-btn-row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.cps-tbl td.cps-tok-total { font-weight: 650; }
+.cps-src-ok { color: var(--green, #34d399); }
+.cps-src-bad { color: var(--red, #f87171); }
 `;
 
 /** 注入插件样式（宿主只加载一次，重复挂载复用同一个 style 节点）。 */
 export function ensureStyles() {
 	if (typeof document === "undefined") return;
-	if (document.getElementById(STYLE_ID)) return;
-	const style = document.createElement("style");
-	style.id = STYLE_ID;
+	let style = document.getElementById(STYLE_ID);
+	if (!style) {
+		style = document.createElement("style");
+		style.id = STYLE_ID;
+		(document.head ?? document.documentElement).appendChild(style);
+	}
 	style.textContent = CSS;
-	(document.head ?? document.documentElement).appendChild(style);
 }
 
 function segment(act, values, ariaLabel) {
@@ -473,6 +478,46 @@ export function buildSkeleton(root) {
 	]);
 	root.appendChild(tableView);
 
+	const tokenBody = h("tbody", { attrs: { "data-k": "tokens.body" } });
+	const tokenTable = h("table", { class: "cps-tbl", attrs: { "data-k": "tokens.table" } }, [
+		h("thead", {}, [
+			h("tr", {}, [
+				h("th", { attrs: { "data-k": "tokens.th.model" } }),
+				h("th", { attrs: { "data-k": "tokens.th.calls" } }),
+				h("th", { attrs: { "data-k": "tokens.th.input" } }),
+				h("th", { attrs: { "data-k": "tokens.th.output" } }),
+				h("th", { attrs: { "data-k": "tokens.th.cacheRead" } }),
+				h("th", { attrs: { "data-k": "tokens.th.cacheWrite" } }),
+				h("th", { attrs: { "data-k": "tokens.th.total" } }),
+				h("th", { attrs: { "data-k": "tokens.th.cost" } }),
+			]),
+		]),
+		tokenBody,
+	]);
+	root.appendChild(
+		h("section", { class: "cps-panel", attrs: { "data-k": "tokens.panel" } }, [
+			h("header", {}, [
+				h("h3", { attrs: { "data-k": "tokens.title" } }),
+				h("span", { class: "cps-panel-sub", attrs: { "data-k": "tokens.hint" } }),
+			]),
+			h("div", { class: "cps-tbl-wrap" }, [tokenTable]),
+			h("div", { class: "cps-empty cps-hidden", attrs: { "data-k": "tokens.empty" } }),
+		]),
+	);
+
+	const priceSources = h("div", { class: "cps-rank", attrs: { "data-k": "prices.sources" } });
+	root.appendChild(
+		h("section", { class: "cps-panel cps-hidden", attrs: { "data-k": "view.prices" } }, [
+			h("header", {}, [
+				h("h3", { attrs: { "data-k": "prices.title" } }),
+				h("span", { class: "cps-panel-sub", attrs: { "data-k": "prices.summary" } }),
+				h("span", { class: "cps-spacer" }),
+				h("button", { class: "cps-btn", attrs: { type: "button", "data-act": "prices-refresh", "data-k": "prices.refresh" } }),
+			]),
+			priceSources,
+		]),
+	);
+
 	// ── 导入面板
 	const importFill = h("i", { attrs: { "data-k": "import.fill" } });
 	const importBar = h("div", { class: "cps-progress", attrs: { "data-k": "import.bar", role: "progressbar", "aria-valuemin": "0", "aria-valuemax": "100", "aria-valuenow": "0" } }, [importFill]);
@@ -495,7 +540,12 @@ export function buildSkeleton(root) {
 	root.appendChild(importing);
 
 	// ── 页脚
-	root.appendChild(h("footer", { class: "cps-foot", attrs: { "data-k": "foot" } }, [h("span", { attrs: { "data-k": "foot.meta" } }), h("span", { attrs: { "data-k": "foot.paths" } })]));
+	root.appendChild(
+		h("footer", { class: "cps-foot", attrs: { "data-k": "foot" } }, [
+			h("span", { attrs: { "data-k": "foot.meta" } }),
+			h("span", { attrs: { "data-k": "foot.paths" } }),
+		]),
+	);
 
 	const sparks = new Map();
 	for (const card of KPI_CARDS) {
